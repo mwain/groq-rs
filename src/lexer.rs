@@ -15,8 +15,11 @@ pub enum Token {
     // Identifiers are used to name entities such as parameters, attributes and functions
     Identifier(String),
 
-    // Numbers are used to represent numeric values, E.g 123, 3.14, 3.14e-10, .5
+    // Numbers are used to represent integer values, E.g 123
     Number(String),
+
+    // Floats are used to represent floating point values, E.g 3.14, 3.14e-10
+    Float(String),
 
     // Single Dot
     Dot,
@@ -205,9 +208,14 @@ impl<'a> Lexer<'a> {
             return Token::Number(number);
         }
 
+        let mut has_fractional = false;
+        let mut has_exponent = false;
+
         if Some('.') == self.peek_nth(0) {
             number.push(self.chars.next().unwrap());
             number += take_while(&mut self.chars, |c| c.is_ascii_digit()).as_str();
+
+            has_fractional = true;
         }
 
         let mut exponent = String::new();
@@ -230,13 +238,19 @@ impl<'a> Lexer<'a> {
 
                     number += exponent.as_str();
                     number += take_while(&mut self.chars, |c| c.is_ascii_digit()).as_str();
+
+                    has_exponent = true;
                 }
-                // Not a valid exponent, return the number as is
-                _ => return Token::Number(number),
+                // Not a valid exponent, ignore
+                _ => {}
             }
         }
 
-        Token::Number(number)
+        if has_fractional || has_exponent {
+            Token::Float(number)
+        } else {
+            Token::Number(number)
+        }
     }
 
     fn dot(&mut self, first_dot: &char) -> Token {
@@ -448,11 +462,11 @@ mod tests {
             Token::And,
             Token::Identifier("b".to_string()),
             Token::GtEq,
-            Token::Number("0.1".to_string()),
+            Token::Float("0.1".to_string()),
             Token::Or,
             Token::Identifier("c".to_string()),
             Token::Lt,
-            Token::Number("3.14e+123".to_string()),
+            Token::Float("3.14e+123".to_string()),
             Token::And,
             Token::String("d".to_string()),
             Token::LtEq,
@@ -476,7 +490,7 @@ mod tests {
             Token::Comma,
             Token::String("b".to_string()),
             Token::Colon,
-            Token::Number("2.0".to_string()),
+            Token::Float("2.0".to_string()),
             Token::Comma,
             Token::String("c".to_string()),
             Token::Colon,

@@ -30,6 +30,10 @@ pub enum Expression {
         range: Range,
     },
 
+    DereferenceTraversal {
+        expr: Box<Expression>,
+    },
+
     AttributeAccess(String),
 
     ElementAccess {
@@ -104,4 +108,5 @@ pub enum Operator {
     Dot,
     DotDotDot,
     Colon,
+    Arrow,
 }

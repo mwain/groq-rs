@@ -46,12 +46,19 @@ impl<'a> Parser<'a> {
             // todo: split this into a separate function? Passing None for lhs isnt very intuitive
             Token::OpenBrace => self.parse_brace_expr(None)?,
 
-            // TODO: lexer knows if this is a int or a float, but has no token for it. For now they are all floats
             Token::Number(n) => {
+                self.next_token();
+                let int = match n.parse::<i64>() {
+                    Ok(i) => i,
+                    Err(e) => Err(format!("failed to parse number into integer: {e}"))?,
+                };
+                Expression::Literal(ast::LiteralKind::Int64(int))
+            }
+            Token::Float(n) => {
                 self.next_token();
                 let float = match n.parse::<f64>() {
                     Ok(f) => f,
-                    Err(e) => Err(format!("failed to parse number into float: {}", e))?,
+                    Err(e) => Err(format!("failed to parse number into float: {e}"))?,
                 };
                 Expression::Literal(ast::LiteralKind::Float64(float))
             }
@@ -74,6 +81,7 @@ impl<'a> Parser<'a> {
             lhs = match next_token {
                 Token::OpenBracket => self.parse_bracket_expr(lhs)?,
                 Token::OpenBrace => self.parse_brace_expr(Some(lhs))?,
+                Token::Arrow => self.parse_arrow_deref(lhs)?,
                 t if is_operator(&t) => self.parse_operator(lhs)?,
                 _ => Err(format!("unexpected token: {:?}", next_token))?,
             };
@@ -132,15 +140,10 @@ impl<'a> Parser<'a> {
 
             // TODO: need to further disambiguating square brackets
             // see https://sanity-io.github.io/GROQ/draft/#sec-Disambiguating-square-bracket-traversal
-
-            // TODO: swap to int64 when we fix the tokenization of numbers
-            Expression::Literal(LiteralKind::Float64(f)) => {
-                let index = f as i64;
-                Expression::ElementAccess {
-                    expr: Box::new(lhs),
-                    index: Box::new(Expression::Literal(LiteralKind::Int64(index))),
-                }
-            }
+            Expression::Literal(LiteralKind::Int64(i)) => Expression::ElementAccess {
+                expr: Box::new(lhs),
+                index: Box::new(Expression::Literal(LiteralKind::Int64(i))),
+            },
 
             constraint => Expression::FilterTraversal {
                 expr: Box::new(lhs),
@@ -219,6 +222,7 @@ impl<'a> Parser<'a> {
                     expr: Box::new(rhs),
                 })
             }
+
             (OperatorType::Infix, op, rbp) => {
                 let rhs = self.parse_expression(rbp)?;
                 Ok(Expression::BinaryOp {
@@ -227,6 +231,28 @@ impl<'a> Parser<'a> {
                     rhs: Box::new(rhs),
                 })
             }
+        }
+    }
+
+    // Parses an deref traversal expression, e.g. foo->bar, or foo->
+    fn parse_arrow_deref(&mut self, lhs: Expression) -> Result<ast::Expression, String> {
+        self.expect_token(Token::Arrow)?;
+
+        match self.peek_token().to_owned() {
+            Token::Identifier(s) => {
+                self.next_token();
+
+                Ok(Expression::BinaryOp {
+                    lhs: Box::new(Expression::DereferenceTraversal {
+                        expr: Box::new(lhs),
+                    }),
+                    operator: Operator::Dot,
+                    rhs: Box::new(Expression::AttributeAccess(s)),
+                })
+            }
+            _ => Ok(Expression::DereferenceTraversal {
+                expr: Box::new(lhs),
+            }),
         }
     }
 
@@ -272,10 +298,11 @@ fn binding_power(token: &Token) -> u8 {
     match token {
         Token::OpenBracket | Token::OpenBrace => 100,
         Token::Dot => 90,
-        Token::Colon => 90,
+        Token::Arrow => 80,
         Token::Eq | Token::NotEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq => 40,
         Token::And => 30,
         Token::Or => 30,
+        Token::Colon => 10,
         _ => 0,
     }
 }
@@ -340,6 +367,7 @@ mod tests {
             {
                 "foo": "bar",
                 "everything": *[_type == 'foo'],
+                "metadata": bar[]->meta->title.en
             }
         "#,
         );
