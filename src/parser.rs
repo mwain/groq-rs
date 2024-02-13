@@ -25,7 +25,6 @@ impl<'a> Parser<'a> {
 
         let token = self.peek_token().to_owned();
 
-        // Parse the left hand side, the null denotation
         let mut lhs = match token {
             Token::Asterisk => {
                 self.next_token();
@@ -34,7 +33,13 @@ impl<'a> Parser<'a> {
             Token::Identifier(s) => {
                 // todo: not all identifiers are attributes, some are functions etc. For now we assume they are all attributes
                 self.next_token();
-                Expression::AttributeAccess(s)
+
+                match s.as_str() {
+                    "true" => Expression::Literal(ast::LiteralKind::Boolean(true)),
+                    "false" => Expression::Literal(ast::LiteralKind::Boolean(false)),
+                    "null" => Expression::Literal(ast::LiteralKind::Null),
+                    _ => Expression::Attr(s),
+                }
             }
             Token::String(s) => {
                 self.next_token();
@@ -44,6 +49,7 @@ impl<'a> Parser<'a> {
             Token::OpenBracket => self.parse_array_expr()?,
 
             // todo: split this into a separate function? Passing None for lhs isnt very intuitive
+            // none = no lhs, so we are parsing an object
             Token::OpenBrace => self.parse_brace_expr(None)?,
 
             Token::Number(n) => {
@@ -62,6 +68,24 @@ impl<'a> Parser<'a> {
                 };
                 Expression::Literal(ast::LiteralKind::Float64(float))
             }
+
+            token if is_prefix_operator(&token) => {
+                let op = match parse_token_operator(&token) {
+                    Some(op) => op,
+                    None => Err(format!("unexpected token: {:?}", token))?,
+                };
+
+                self.next_token();
+
+                let rbp = binding_power(&token, OperatorType::Prefix).1;
+                let rhs = self.parse_expression(rbp)?;
+
+                Expression::UnaryOp {
+                    operator: op,
+                    expr: Box::new(rhs),
+                }
+            }
+
             _ => Err(format!("unexpected token: {:?}", token))?,
         };
 
@@ -72,18 +96,18 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            let lbp = binding_power(&next_token);
+            let (lbp, _) = binding_power(&next_token, OperatorType::Infix);
             if lbp < rbp {
                 break;
             }
 
-            // Parse the right hand side, the left denotation
             lhs = match next_token {
                 Token::OpenBracket => self.parse_bracket_expr(lhs)?,
                 Token::OpenBrace => self.parse_brace_expr(Some(lhs))?,
                 Token::Arrow => self.parse_arrow_deref(lhs)?,
                 t if is_operator(&t) => self.parse_operator(lhs)?,
-                _ => Err(format!("unexpected token: {:?}", next_token))?,
+                // Nothing to do here, we've reached the end of the expression
+                _ => break,
             };
         }
 
@@ -97,7 +121,7 @@ impl<'a> Parser<'a> {
 
         let mut elements = Vec::new();
 
-        let expr = self.parse_expression(1)?;
+        let expr = self.parse_expression(0)?;
         elements.push(expr);
 
         while self.peek_token() == &Token::Comma {
@@ -108,13 +132,13 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            let expr = self.parse_expression(1)?;
+            let expr = self.parse_expression(0)?;
             elements.push(expr);
         }
 
         self.expect_token(Token::CloseBracket)?;
 
-        Ok(Expression::Array { elements })
+        Ok(Expression::ArrayElements { elements })
     }
 
     // Parses a bracket suffix expression like foo[1], or foo[bar == "baz"]
@@ -126,16 +150,15 @@ impl<'a> Parser<'a> {
         if next_token == &Token::CloseBracket {
             self.expect_token(Token::CloseBracket)?;
 
-            return Ok(Expression::ArrayTraversal {
+            return Ok(Expression::ArrayPostfix {
                 expr: Box::new(lhs),
             });
         }
 
-        let expr = match self.parse_expression(1)? {
-            Expression::Literal(LiteralKind::String(s)) => Expression::BinaryOp {
-                lhs: Box::new(lhs),
-                operator: ast::Operator::Dot,
-                rhs: Box::new(Expression::AttributeAccess(s)),
+        let expr = match self.parse_expression(0)? {
+            Expression::Literal(LiteralKind::String(s)) => Expression::AttributeAccess {
+                expr: Box::new(lhs),
+                name: s,
             },
 
             // TODO: need to further disambiguating square brackets
@@ -167,7 +190,7 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            let attr = match self.parse_expression(1)? {
+            let attr = match self.parse_expression(0)? {
                 Expression::BinaryOp {
                     lhs,
                     operator: Operator::Colon,
@@ -195,8 +218,9 @@ impl<'a> Parser<'a> {
 
         let obj: ast::Object = ast::Object { entries };
 
+        // none = no lhs, so we are parsing an object
         match lhs {
-            Some(lhs) => Ok(Expression::ProjectionTraversal {
+            Some(lhs) => Ok(Expression::Projection {
                 expr: Box::new(lhs),
                 object: obj,
             }),
@@ -205,32 +229,39 @@ impl<'a> Parser<'a> {
     }
 
     // Parses an expression with an operator, either prefix or infix
-    // A left denotation/rhs of the parser
     fn parse_operator(&mut self, lhs: Expression) -> Result<ast::Expression, String> {
         let token = self.next_token();
 
-        let op = match token_into_operator(&token) {
+        let op = match parse_token_operator(&token) {
             Some(op) => op,
             None => Err(format!("unexpected token: {:?}", token))?,
         };
 
-        match op {
-            (OperatorType::Prefix, op, rbp) => {
-                let rhs = self.parse_expression(rbp)?;
-                Ok(Expression::UnaryOp {
-                    operator: op,
-                    expr: Box::new(rhs),
-                })
-            }
+        let (_, rbp) = binding_power(&token, OperatorType::Infix);
+        let rhs = self.parse_expression(rbp)?;
 
-            (OperatorType::Infix, op, rbp) => {
-                let rhs = self.parse_expression(rbp)?;
-                Ok(Expression::BinaryOp {
-                    lhs: Box::new(lhs),
-                    operator: op,
-                    rhs: Box::new(rhs),
-                })
+        match op {
+            Operator::Dot => {
+                match (&lhs, &rhs) {
+                    // When rhs is a Attr, we can convert this into an attribute access traversal
+                    (_, Expression::Attr(rhs)) => Ok(Expression::AttributeAccess {
+                        expr: Box::new(lhs),
+                        name: rhs.to_string(),
+                    }),
+
+                    // TODO: is this valid, or should we error?
+                    _ => Ok(Expression::BinaryOp {
+                        lhs: Box::new(lhs),
+                        operator: Operator::Dot,
+                        rhs: Box::new(rhs),
+                    }),
+                }
             }
+            _ => Ok(Expression::BinaryOp {
+                lhs: Box::new(lhs),
+                operator: op,
+                rhs: Box::new(rhs),
+            }),
         }
     }
 
@@ -242,15 +273,14 @@ impl<'a> Parser<'a> {
             Token::Identifier(s) => {
                 self.next_token();
 
-                Ok(Expression::BinaryOp {
-                    lhs: Box::new(Expression::DereferenceTraversal {
+                Ok(Expression::AttributeAccess {
+                    expr: Box::new(Expression::Dereference {
                         expr: Box::new(lhs),
                     }),
-                    operator: Operator::Dot,
-                    rhs: Box::new(Expression::AttributeAccess(s)),
+                    name: s,
                 })
             }
-            _ => Ok(Expression::DereferenceTraversal {
+            _ => Ok(Expression::Dereference {
                 expr: Box::new(lhs),
             }),
         }
@@ -294,21 +324,17 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn binding_power(token: &Token) -> u8 {
-    match token {
-        Token::OpenBracket | Token::OpenBrace => 100,
-        Token::Dot => 90,
-        Token::Arrow => 80,
-        Token::Eq | Token::NotEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq => 40,
-        Token::And => 30,
-        Token::Or => 30,
-        Token::Colon => 10,
-        _ => 0,
-    }
-}
-
 fn is_operator(token: &Token) -> bool {
     parse_token_operator(token).is_some()
+}
+
+fn is_prefix_operator(token: &Token) -> bool {
+    match parse_token_operator(token) {
+        Some(Operator::Not) => true,
+        Some(Operator::Plus) => true,
+        Some(Operator::Minus) => true,
+        _ => false,
+    }
 }
 
 fn parse_token_operator(token: &Token) -> Option<ast::Operator> {
@@ -338,21 +364,47 @@ fn parse_token_operator(token: &Token) -> Option<ast::Operator> {
 enum OperatorType {
     Prefix,
     Infix,
+    Postfix,
 }
 
-fn token_into_operator(token: &Token) -> Option<(OperatorType, ast::Operator, u8)> {
-    match parse_token_operator(token) {
-        // Prefix operators
-        Some(ast::Operator::Not) => Some((
-            OperatorType::Prefix,
-            ast::Operator::Not,
-            binding_power(token),
-        )),
-
-        // Infix operators, the rest...
-        Some(op) => Some((OperatorType::Infix, op, binding_power(token))),
-
-        None => None,
+// Returns the left and right binding power for the given token and operator type
+//
+// Based on the GROQ precedence and associativity
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#sec-Precedence-and-associativity
+// Level 11: Compound expressions.
+// Level 10, prefix: +, !.
+// Level 9, right-associative: **.
+// Level 8, prefix: -.
+// Level 7, left-associative: Multiplicatives (*, /, %).
+// Level 6, left-associative: Additives (+, -).
+// Level 5, non-associative: Ranges (.., ...).
+// Level 4, non-associative: Comparisons (==, !=, >, >=,<, <=, in, match).
+// Level 4, postfix: Ordering (asc, desc).
+// Level 3, left-associative: &&.
+// Level 2, left-associative: ||.
+// Level 1, non-associative: =>.
+fn binding_power(token: &Token, op: OperatorType) -> (u8, u8) {
+    match op {
+        OperatorType::Prefix => match token {
+            Token::Not => (0, 100),                // Level 10, non-associative
+            Token::Plus | Token::Minus => (0, 80), // Level 8, non-associative
+            _ => (0, 0),
+        },
+        OperatorType::Infix => match token {
+            Token::Colon => (10, 11), // For object attribute
+            Token::Or => (20, 21),    // Level 2, left-associative
+            Token::And => (30, 31),   // Level 3, left-associative
+            Token::Eq | Token::NotEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq => {
+                (40, 40)
+            } // Level 4, non-associative
+            // Level 5 not implemented yet
+            Token::Plus | Token::Minus => (60, 61), // Level 6, left-associative
+            Token::Asterisk | Token::Slash | Token::Percent => (70, 71), // Level 7, left-associative
+            Token::DoubleStar => (91, 90), // Level 9, right-associative
+            // Level 11 not implemented yet
+            _ => (0, 0),
+        },
+        OperatorType::Postfix => (0, 0),
     }
 }
 
@@ -360,8 +412,686 @@ fn token_into_operator(token: &Token) -> Option<(OperatorType, ast::Operator, u8
 mod tests {
     use super::*;
 
+    macro_rules! parser_test {
+        ($($name:ident: $s:expr,)*) => {
+        $(
+            #[test]
+            fn $name() {
+                let (query, expected) = $s;
+
+                let lex: Lexer<'_> = Lexer::new(query);
+                let mut parser = Parser::new(lex);
+                let output = parser.parse().unwrap();
+
+                assert_eq!(output, expected);
+            }
+        )*
+        }
+    }
+
+    parser_test!(
+        attr_access: ("foo.bar", Expression::AttributeAccess { expr: Box::new(Expression::Attr("foo".to_string())), name: "bar".to_string() }),
+
+        attr_access_bracket: ("foo[\"bar\"]", Expression::AttributeAccess { expr: Box::new(Expression::Attr("foo".to_string())), name: "bar".to_string() }),
+
+        attr_access_everything: ("*.bar", Expression::AttributeAccess { expr: Box::new(Expression::Everything), name: "bar".to_string() }),
+
+        attr_access_everything_bracket: ("*['bar']", Expression::AttributeAccess { expr: Box::new(Expression::Everything), name: "bar".to_string() }),
+
+        attr_access_object: (
+            "{\"foo\": bar}.foo",
+            Expression::AttributeAccess {
+                expr: Box::new(Expression::Object(ast::Object {
+                    entries: vec![
+                        ast::ObjectAttribute::AliasedExpression{
+                            alias: "foo".to_string(),
+                            expr: Box::new(Expression::Attr("bar".to_string()))
+                        },
+                    ]})
+                ),
+                name: "foo".to_string()
+            }
+        ),
+
+        array_elements: ("[1, 2, 3]", Expression::ArrayElements { elements: vec![Expression::Literal(LiteralKind::Int64(1)), Expression::Literal(LiteralKind::Int64(2)), Expression::Literal(LiteralKind::Int64(3))] }),
+
+        array_postfix: ("foo[]", Expression::ArrayPostfix { expr: Box::new(Expression::Attr("foo".to_string())) }),
+
+        array_postfix_with_filter: (
+            "foo[bar == 'baz']",
+            Expression::FilterTraversal {
+                expr: Box::new(Expression::Attr("foo".to_string())),
+                constraint: Box::new(Expression::BinaryOp { lhs: Box::new(Expression::Attr("bar".to_string())), operator: Operator::Eq, rhs: Box::new(Expression::Literal(LiteralKind::String("baz".to_string())))
+            })
+        }),
+
+        array_chained_ints: (
+            "[1, 2, [3, 4, 5]][3][0]",
+            Expression::ElementAccess {
+                expr: Box::new(Expression::ElementAccess {
+                    expr: Box::new(Expression::ArrayElements {
+                        elements: vec![
+                            Expression::Literal(LiteralKind::Int64(1)),
+                            Expression::Literal(LiteralKind::Int64(2)),
+                            Expression::ArrayElements {
+                                elements: vec![
+                                    Expression::Literal(LiteralKind::Int64(3)),
+                                    Expression::Literal(LiteralKind::Int64(4)),
+                                    Expression::Literal(LiteralKind::Int64(5)),
+                                ]
+                            }
+                        ]
+                    }),
+                    index: Box::new(Expression::Literal(LiteralKind::Int64(3))),
+                }),
+                index: Box::new(Expression::Literal(LiteralKind::Int64(0))),
+            }
+        ),
+
+        array_bool: (
+            "[true, false, null][0]",
+            Expression::ElementAccess {
+                expr: Box::new(Expression::ArrayElements {
+                    elements: vec![
+                        Expression::Literal(LiteralKind::Boolean(true)),
+                        Expression::Literal(LiteralKind::Boolean(false)),
+                        Expression::Literal(LiteralKind::Null),
+                    ]
+                }),
+                index: Box::new(Expression::Literal(LiteralKind::Int64(0))),
+            }
+        ),
+
+        object: (
+            "{\"foo\": bar, \"baz\": 2}",
+            Expression::Object(ast::Object {
+                entries: vec![
+                    ast::ObjectAttribute::AliasedExpression {
+                        alias: "foo".to_string(),
+                        expr: Box::new(Expression::Attr("bar".to_string()))
+                    },
+                    ast::ObjectAttribute::AliasedExpression {
+                        alias: "baz".to_string(),
+                        expr: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                    },
+                ]
+            })
+        ),
+
+        object_nested: (
+            "{\"foo\": {\"bar\": 2}}",
+            Expression::Object(ast::Object {
+                entries: vec![
+                    ast::ObjectAttribute::AliasedExpression {
+                        alias: "foo".to_string(),
+                        expr: Box::new(Expression::Object(ast::Object {
+                            entries: vec![
+                                ast::ObjectAttribute::AliasedExpression {
+                                    alias: "bar".to_string(),
+                                    expr: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                                }
+                            ]
+                        }))
+                    }
+                ]
+            })
+        ),
+
+        dereference: (
+            "foo->bar",
+            Expression::AttributeAccess {
+                expr: Box::new(Expression::Dereference { expr: Box::new(Expression::Attr("foo".to_string())) }),
+                name: "bar".to_string()
+            },
+        ),
+
+        dereference_nested_array: (
+            "bar[]->meta->title.en",
+            Expression::AttributeAccess {
+                expr: Box::new(Expression::AttributeAccess {
+                    expr: Box::new(Expression::Dereference {
+                        expr: Box::new(Expression::AttributeAccess {
+                            expr: Box::new(Expression::Dereference {
+                                expr: Box::new(Expression::ArrayPostfix { expr: Box::new(Expression::Attr("bar".to_string())) })
+                            }),
+                            name: "meta".to_string()
+                        })
+                    }),
+                    name: "title".to_string()
+                }),
+                name: "en".to_string()
+            }
+        ),
+
+        dereference_projection: (
+            "foo->{bar, baz}",
+            Expression::Projection {
+                expr: Box::new(Expression::Dereference { expr: Box::new(Expression::Attr("foo".to_string())) }),
+                object: ast::Object {
+                    entries: vec![
+                        ast::ObjectAttribute::Expression(Box::new(Expression::Attr("bar".to_string()))),
+                        ast::ObjectAttribute::Expression(Box::new(Expression::Attr("baz".to_string()))),
+                    ]
+                }
+            }
+        ),
+
+        dereference_projection_attr_access: (
+            "foo->{bar, baz}.bar",
+            Expression::AttributeAccess {
+                expr: Box::new(Expression::Projection {
+                    expr: Box::new(Expression::Dereference { expr: Box::new(Expression::Attr("foo".to_string())) }),
+                    object: ast::Object {
+                        entries: vec![
+                            ast::ObjectAttribute::Expression(Box::new(Expression::Attr("bar".to_string()))),
+                            ast::ObjectAttribute::Expression(Box::new(Expression::Attr("baz".to_string()))),
+                        ]
+                    }
+                }),
+                name: "bar".to_string()
+            }
+        ),
+
+        // TODO: Need implementation for this
+        ranged_slice_exl: (
+            "foo[1..3]",
+            Expression::SliceTraversal {
+                range: ast::Range {
+                    start: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                    end: Box::new(Expression::Literal(LiteralKind::Int64(3))),
+                    inclusive: false,
+                }
+            }
+        ),
+    );
+
+    // Tests for precedence and associativity
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#sec-Precedence-and-associativity
+    // Level 11: Compound expressions.
+    // Level 10, prefix: +, !.
+    // Level 9, right-associative: **.
+    // Level 8, prefix: -.
+    // Level 7, left-associative: Multiplicatives (*, /, %).
+    // Level 6, left-associative: Additives (+, -).
+    // Level 5, non-associative: Ranges (.., ...).
+    // Level 4, non-associative: Comparisons (==, !=, >, >=,<, <=, in, match).
+    // Level 4, postfix: Ordering (asc, desc).
+    // Level 3, left-associative: &&.
+    // Level 2, left-associative: ||.
+    // Level 1, non-associative: =>.
+    parser_test!(
+        // => is not implemented yet
+        // level_1:
+
+        level_2: (
+            "true || false || true",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(true))),
+                    operator: Operator::Or,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
+            }
+        ),
+
+        level_3: (
+            "true && false && true",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(true))),
+                    operator: Operator::And,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
+                }),
+                operator: Operator::And,
+                rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
+            }
+        ),
+
+        level_3_2: (
+            "true || false && false || true",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(true))),
+                    operator: Operator::Or,
+                    rhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Boolean(false))),
+                        operator: Operator::And,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
+                    })
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
+            }
+        ),
+
+        level_3_2a: (
+            "true && false || false && true",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(true))),
+                    operator: Operator::And,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(false))),
+                    operator: Operator::And,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
+                })
+            }
+        ),
+
+        level_4_ands: (
+            "1 == 2 && 3 != 4 && 5 > 6 && 7 >= 8 && 9 < 10 && 11 <= 12",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::BinaryOp {
+                            lhs: Box::new(Expression::BinaryOp {
+                                lhs: Box::new(Expression::BinaryOp {
+                                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                                    operator: Operator::Eq,
+                                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                                }),
+                                operator: Operator::And,
+                                rhs: Box::new(Expression::BinaryOp {
+                                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
+                                    operator: Operator::NotEq,
+                                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                                })
+                            }),
+                            operator: Operator::And,
+                            rhs: Box::new(Expression::BinaryOp {
+                                lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
+                                operator: Operator::Gt,
+                                rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
+                            })
+                        }),
+                        operator: Operator::And,
+                        rhs: Box::new(Expression::BinaryOp {
+                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(7))),
+                            operator: Operator::GtEq,
+                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(8)))
+                        })
+                    }),
+                    operator: Operator::And,
+                    rhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(9))),
+                        operator: Operator::Lt,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(10)))
+                    })
+                }),
+                operator: Operator::And,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(11))),
+                    operator: Operator::LtEq,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(12)))
+                }),
+            }
+        ),
+
+        level_4_ors: (
+            "1 == 2 || 3 != 4 || 5 > 6 || 7 >= 8 || 9 < 10 || 11 <= 12",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::BinaryOp {
+                            lhs: Box::new(Expression::BinaryOp {
+                                lhs: Box::new(Expression::BinaryOp {
+                                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                                    operator: Operator::Eq,
+                                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                                }),
+                                operator: Operator::Or,
+                                rhs: Box::new(Expression::BinaryOp {
+                                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
+                                    operator: Operator::NotEq,
+                                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                                })
+                            }),
+                            operator: Operator::Or,
+                            rhs: Box::new(Expression::BinaryOp {
+                                lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
+                                operator: Operator::Gt,
+                                rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
+                            })
+                        }),
+                        operator: Operator::Or,
+                        rhs: Box::new(Expression::BinaryOp {
+                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(7))),
+                            operator: Operator::GtEq,
+                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(8)))
+                        })
+                    }),
+                    operator: Operator::Or,
+                    rhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(9))),
+                        operator: Operator::Lt,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(10)))
+                    })
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(11))),
+                    operator: Operator::LtEq,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(12)))
+                }),
+            }
+        ),
+
+        level_4_ands_ors: (
+            "1 == 2 && 3 != 4 || 5 > 6 && 7 >= 8 || 9 < 10 && 11 <= 12",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::BinaryOp {
+                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                            operator: Operator::Eq,
+                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                        }),
+                        operator: Operator::And,
+                        rhs: Box::new(Expression::BinaryOp {
+                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
+                            operator: Operator::NotEq,
+                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                        })
+                    }),
+                    operator: Operator::Or,
+                    rhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::BinaryOp {
+                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
+                            operator: Operator::Gt,
+                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
+                        }),
+                        operator: Operator::And,
+                        rhs: Box::new(Expression::BinaryOp {
+                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(7))),
+                            operator: Operator::GtEq,
+                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(8)))
+                        })
+                    })
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(9))),
+                        operator: Operator::Lt,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(10)))
+                    }),
+                    operator: Operator::And,
+                    rhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(11))),
+                        operator: Operator::LtEq,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(12)))
+                    })
+                }),
+            }
+        ),
+
+        // Rang(.., ...) not implemented yet
+        // level_5:
+
+        level_6: (
+            "1 + 2 - 3 + 4",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                        operator: Operator::Plus,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                    }),
+                    operator: Operator::Minus,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(3)))
+                }),
+                operator: Operator::Plus,
+                rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+            }
+        ),
+
+        level_6_2: (
+            "1 + 2 || 3 - 4 && 5 + 6",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                    operator: Operator::Plus,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
+                        operator: Operator::Minus,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                    }),
+                    operator: Operator::And,
+                    rhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
+                        operator: Operator::Plus,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
+                    })
+                })
+            }
+        ),
+
+        level_7: (
+            "1 * 2 / 3 % 4",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                        operator: Operator::Star,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                    }),
+                    operator: Operator::Slash,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(3)))
+                }),
+                operator: Operator::Percent,
+                rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+            }
+        ),
+
+        level_7_6: (
+            "1 * 2 / 3 + 4 * 5 % 6",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                        operator: Operator::Star,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                    }),
+                    operator: Operator::Slash,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(3)))
+                }),
+                operator: Operator::Plus,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(4))),
+                        operator: Operator::Star,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(5)))
+                    }),
+                    operator: Operator::Percent,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
+                })
+            }
+        ),
+
+        level_7_2_3: (
+            "1 * 2 || 3 / 4 && 5 * 6",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                    operator: Operator::Star,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
+                        operator: Operator::Slash,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                    }),
+                    operator: Operator::And,
+                    rhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
+                        operator: Operator::Star,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
+                    })
+                })
+            }
+        ),
+
+        level_8: (
+            "+1 - 2",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::UnaryOp {
+                    operator: Operator::Plus,
+                    expr: Box::new(Expression::Literal(LiteralKind::Int64(1)))
+                }),
+                operator: Operator::Minus,
+                rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+            }
+        ),
+
+        level_8_7: (
+            "+1 * 2 - -3 / 4",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::UnaryOp {
+                        operator: Operator::Plus,
+                        expr: Box::new(Expression::Literal(LiteralKind::Int64(1)))
+                    }),
+                    operator: Operator::Star,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                }),
+                operator: Operator::Minus,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::UnaryOp {
+                        operator: Operator::Minus,
+                        expr: Box::new(Expression::Literal(LiteralKind::Int64(3)))
+                    }),
+                    operator: Operator::Slash,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                })
+            }
+        ),
+
+        level_8_2_3: (
+            "+1 || 2 - -3 && 4",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::UnaryOp {
+                    operator: Operator::Plus,
+                    expr: Box::new(Expression::Literal(LiteralKind::Int64(1)))
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(2))),
+                        operator: Operator::Minus,
+                        rhs: Box::new(Expression::UnaryOp {
+                            operator: Operator::Minus,
+                            expr: Box::new(Expression::Literal(LiteralKind::Int64(3)))
+                        }),
+                    }),
+                    operator: Operator::And,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                })
+            }
+        ),
+
+        level_9: (
+            "1 ** 2 ** 3",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                operator: Operator::DoubleStar,
+                rhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(2))),
+                    operator: Operator::DoubleStar,
+                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(3)))
+                })
+            }
+        ),
+
+        level_9_8: (
+            "1 ** +2 ** -3",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                operator: Operator::DoubleStar,
+                rhs: Box::new(Expression::UnaryOp {
+                    operator: Operator::Plus,
+                    expr: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(2))),
+                        operator: Operator::DoubleStar,
+                        rhs: Box::new(Expression::UnaryOp {
+                            operator: Operator::Minus,
+                            expr: Box::new(Expression::Literal(LiteralKind::Int64(3)))
+                        })
+                    })
+                })
+            }
+        ),
+
+        level_9_8_2: (
+            "1 ** +2 || -3 ** 4",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
+                    operator: Operator::DoubleStar,
+                    rhs: Box::new(Expression::UnaryOp {
+                        operator: Operator::Plus,
+                        expr: Box::new(Expression::Literal(LiteralKind::Int64(2)))
+                    }),
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::UnaryOp {
+                    operator: Operator::Minus,
+                    expr: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
+                        operator: Operator::DoubleStar,
+                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                    })
+                })
+            }
+        ),
+
+        level_10: (
+            "!true",
+            Expression::UnaryOp {
+                operator: Operator::Not,
+                expr: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
+            }
+        ),
+
+        level_10_2_3: (
+            "!true || !false && !true || true",
+            Expression::BinaryOp {
+                lhs: Box::new(Expression::BinaryOp {
+                    lhs: Box::new(Expression::UnaryOp {
+                        operator: Operator::Not,
+                        expr: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
+                    }),
+                    operator: Operator::Or,
+                    rhs: Box::new(Expression::BinaryOp {
+                        lhs: Box::new(Expression::UnaryOp {
+                            operator: Operator::Not,
+                            expr: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
+                        }),
+                        operator: Operator::And,
+                        rhs: Box::new(Expression::UnaryOp {
+                            operator: Operator::Not,
+                            expr: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
+                        }),
+                    })
+                }),
+                operator: Operator::Or,
+                rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
+            }
+        ),
+    );
+
     #[test]
-    fn test_parser() {
+    fn test_print_output() {
         let lex: Lexer<'_> = Lexer::new(
             r#"
             {

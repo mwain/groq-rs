@@ -1,45 +1,55 @@
 #[derive(Debug, PartialEq)]
 pub enum Expression {
-    Array {
-        elements: Vec<Expression>,
+
+    // Traversals...
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#TraversalExpression
+
+
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#AttributeAccess
+    AttributeAccess {
+        expr: Box<Expression>,
+        name: String,
     },
 
-    Object(Object),
-
-    // An array postfix coerces the expression into an array.
-    // E.g. foo.bar[]
-    ArrayTraversal {
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Dereference
+    Dereference {
         expr: Box<Expression>,
     },
 
-    // A projection operator returns a new object.
-    // E.g. *[_type == "person"]{name, "isLegal": age >= 18}
-    ProjectionTraversal {
-        expr: Box<Expression>,
-        object: Object,
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Slice
+    SliceTraversal {
+        range: Range,
     },
 
-    // A filter returns an array filtered another expression.
-    // E.g. foo[bar == "baz"], or *[foo == "bar"]
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Filter
     FilterTraversal {
         expr: Box<Expression>,
         constraint: Box<Expression>,
     },
 
-    SliceTraversal {
-        range: Range,
-    },
-
-    DereferenceTraversal {
-        expr: Box<Expression>,
-    },
-
-    AttributeAccess(String),
-
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#ElementAccess
     ElementAccess {
         expr: Box<Expression>,
         index: Box<Expression>,
     },
+
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#ArrayPostfix
+    ArrayPostfix {
+        expr: Box<Expression>,
+    },
+
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Projection
+    Projection {
+        expr: Box<Expression>,
+        object: Object,
+    },
+
+    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#ArrayElements
+    ArrayElements {
+        elements: Vec<Expression>,
+    },
+
+    Object(Object),
 
     BinaryOp {
         lhs: Box<Expression>,
@@ -56,6 +66,13 @@ pub enum Expression {
     This,
     Everything,
     Parent,
+    Attr(String),
+}
+
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#TraversalExpression
+#[derive(Debug, PartialEq)]
+pub enum TraversalExpression {
+
 }
 
 #[derive(Debug, PartialEq)]
@@ -69,11 +86,12 @@ pub enum LiteralKind {
 
 #[derive(Debug, PartialEq)]
 pub struct Range {
-    start: Box<Expression>,
-    end: Box<Expression>,
-    inclusive: bool,
+    pub start: Box<Expression>,
+    pub  end: Box<Expression>,
+    pub inclusive: bool,
 }
 
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#sec-Object
 #[derive(Debug, PartialEq)]
 pub struct Object {
     pub entries: Vec<ObjectAttribute>,

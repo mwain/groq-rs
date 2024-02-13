@@ -110,6 +110,9 @@ pub enum Token {
 
     EmptyBrackets,
 
+    // ^
+    Hat,
+
     // A character that we don't recognize
     Unknown,
 }
