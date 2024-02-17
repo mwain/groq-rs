@@ -108,6 +108,7 @@ pub enum Token {
     // Single or double quoted string
     String(String),
 
+    // []
     EmptyBrackets,
 
     // ^
@@ -150,7 +151,14 @@ impl<'a> Lexer<'a> {
                 '"' | '\'' => self.string(&c),
 
                 '*' => Token::Asterisk,
-                '[' => Token::OpenBracket,
+                '[' => {
+                    if Some(&']') == self.chars.peek() {
+                        self.chars.next();
+                        Token::EmptyBrackets
+                    } else {
+                        Token::OpenBracket
+                    }
+                },
                 ']' => Token::CloseBracket,
                 '(' => Token::OpenParen,
                 ')' => Token::CloseParen,
@@ -445,6 +453,7 @@ mod tests {
                 "a": 1,
                 "b": 2.0,
                 "c": true,
+                "d": d[]
             }
         "#;
 
@@ -499,6 +508,10 @@ mod tests {
             Token::Colon,
             Token::Identifier("true".to_string()),
             Token::Comma,
+            Token::String("d".to_string()),
+            Token::Colon,
+            Token::Identifier("d".to_string()),
+            Token::EmptyBrackets,
             Token::CloseBrace,
             Token::EOF,
         ];

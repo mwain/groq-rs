@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::ast::{self, Expression, LiteralKind, Operator};
+use crate::ast::{self, *};
 use crate::lexer::{Lexer, Token};
 
 pub struct Parser<'a> {
@@ -16,34 +16,34 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn parse(&mut self) -> Result<ast::Expression, String> {
+    pub fn parse(&mut self) -> Result<Box<Expression>, String> {
         self.parse_expression(0)
     }
 
-    fn parse_expression(&mut self, rbp: u8) -> Result<ast::Expression, String> {
+    fn parse_expression(&mut self, rbp: u8) -> Result<Box<Expression>, String> {
         // Top Down Operator Precedence / Pratt Parser
 
         let token = self.peek_token().to_owned();
+        println!("-- parse_expression: {:?}, rbp: {} ---", token, rbp);
 
         let mut lhs = match token {
             Token::Asterisk => {
                 self.next_token();
-                Expression::Everything
+                make_expr(ExpressionKind::Everything)
             }
             Token::Identifier(s) => {
                 // todo: not all identifiers are attributes, some are functions etc. For now we assume they are all attributes
                 self.next_token();
-
-                match s.as_str() {
-                    "true" => Expression::Literal(ast::LiteralKind::Boolean(true)),
-                    "false" => Expression::Literal(ast::LiteralKind::Boolean(false)),
-                    "null" => Expression::Literal(ast::LiteralKind::Null),
-                    _ => Expression::Attr(s),
-                }
+                make_expr(match s.as_str() {
+                    "true" => ExpressionKind::Literal(LiteralKind::Boolean(true)),
+                    "false" => ExpressionKind::Literal(LiteralKind::Boolean(false)),
+                    "null" => ExpressionKind::Literal(LiteralKind::Null),
+                    _ => ExpressionKind::Attr(s),
+                })
             }
             Token::String(s) => {
                 self.next_token();
-                Expression::Literal(ast::LiteralKind::String(s))
+                make_expr(ExpressionKind::Literal(LiteralKind::String(s)))
             }
 
             Token::OpenBracket => self.parse_array_expr()?,
@@ -58,7 +58,7 @@ impl<'a> Parser<'a> {
                     Ok(i) => i,
                     Err(e) => Err(format!("failed to parse number into integer: {e}"))?,
                 };
-                Expression::Literal(ast::LiteralKind::Int64(int))
+                make_expr(ExpressionKind::Literal(ast::LiteralKind::Int64(int)))
             }
             Token::Float(n) => {
                 self.next_token();
@@ -66,7 +66,7 @@ impl<'a> Parser<'a> {
                     Ok(f) => f,
                     Err(e) => Err(format!("failed to parse number into float: {e}"))?,
                 };
-                Expression::Literal(ast::LiteralKind::Float64(float))
+                make_expr(ExpressionKind::Literal(LiteralKind::Float64(float)))
             }
 
             token if is_prefix_operator(&token) => {
@@ -80,15 +80,16 @@ impl<'a> Parser<'a> {
                 let rbp = binding_power(&token, OperatorType::Prefix).1;
                 let rhs = self.parse_expression(rbp)?;
 
-                Expression::UnaryOp {
+                make_expr(ExpressionKind::UnaryOp(UnaryOp {
                     operator: op,
-                    expr: Box::new(rhs),
-                }
+                    expr: rhs,
+                }))
             }
 
             _ => Err(format!("unexpected token: {:?}", token))?,
         };
 
+        let mut counter = 0;
         loop {
             let next_token = self.peek_token().to_owned();
             if next_token == Token::EOF {
@@ -96,27 +97,63 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            let (lbp, _) = binding_power(&next_token, OperatorType::Infix);
-            if lbp < rbp {
-                break;
+            println!("---- rhs {counter}",);
+
+            if is_postfix_operator(&next_token) {
+                let (lbp, _) = binding_power(&next_token, OperatorType::Postfix);
+                println!(
+                    "postfix_next_token: {:?}, lbp: {}, rbp: {}",
+                    next_token, lbp, rbp
+                );
+
+                if lbp < rbp {
+                    print!("-- break rhs postfix ---");
+                    break;
+                }
+
+                lhs = match next_token {
+                    Token::EmptyBrackets => {
+                        self.expect_token(Token::EmptyBrackets)?;
+                        make_expr(ExpressionKind::ArrayPostfix(ArrayPostfix { expr: lhs }))
+                    }
+                    _ => Err(format!("unexpected token: {:?}", next_token))?,
+                };
+                continue;
             }
+
+            let (lbp, _) = binding_power(&next_token, OperatorType::Infix);
+            println!("next_token: {:?}, lbp: {}, rbp: {}", next_token, lbp, rbp);
 
             lhs = match next_token {
                 Token::OpenBracket => self.parse_bracket_expr(lhs)?,
                 Token::OpenBrace => self.parse_brace_expr(Some(lhs))?,
                 Token::Arrow => self.parse_arrow_deref(lhs)?,
-                t if is_operator(&t) => self.parse_operator(lhs)?,
+                t if is_operator(&t) => {
+                    if lbp < rbp {
+                        print!("-- break rhs ---");
+                        break;
+                    }
+
+                    self.parse_operator(lhs)?
+                }
                 // Nothing to do here, we've reached the end of the expression
-                _ => break,
+                _ => {
+                    print!("-- break rhs nothing ---");
+                    break;
+                }
             };
+
+            counter += 1;
+            println!("---- done rhs {counter} {:?}", lhs);
         }
+
+        println!("-- end parse_expression ---");
 
         Ok(lhs)
     }
 
     // Parses an array expression like [1, 2, 3], or [foo.bar[], bar]
-    // To be used in the null denotation/lhs of the parser
-    fn parse_array_expr(&mut self) -> Result<ast::Expression, String> {
+    fn parse_array_expr(&mut self) -> Result<Box<Expression>, String> {
         self.expect_token(Token::OpenBracket)?;
 
         let mut elements = Vec::new();
@@ -138,49 +175,73 @@ impl<'a> Parser<'a> {
 
         self.expect_token(Token::CloseBracket)?;
 
-        Ok(Expression::ArrayElements { elements })
+        Ok(make_expr(ExpressionKind::ArrayElements(ArrayElements {
+            elements: elements.into_iter().map(|expr| *expr).collect(),
+        })))
     }
 
-    // Parses a bracket suffix expression like foo[1], or foo[bar == "baz"]
-    // To be used in the left denotation/rhs of the parser
-    fn parse_bracket_expr(&mut self, lhs: Expression) -> Result<ast::Expression, String> {
+    // Parses a bracket suffix expression like foo[1], foo[bar == "baz"] and foo[1..2]
+    fn parse_bracket_expr(&mut self, lhs: Box<Expression>) -> Result<Box<Expression>, String> {
         self.expect_token(Token::OpenBracket)?;
 
-        let next_token = self.peek_token();
-        if next_token == &Token::CloseBracket {
-            self.expect_token(Token::CloseBracket)?;
+        println!("-- parse_bracket_expr");
 
-            return Ok(Expression::ArrayPostfix {
-                expr: Box::new(lhs),
-            });
-        }
-
-        let expr = match self.parse_expression(0)? {
-            Expression::Literal(LiteralKind::String(s)) => Expression::AttributeAccess {
-                expr: Box::new(lhs),
-                name: s,
-            },
+        let parsed_expr = self.parse_expression(0)?;
+        let kind = match parsed_expr.kind {
+            ExpressionKind::Literal(LiteralKind::String(s)) => {
+                ExpressionKind::AttributeAccess(AttributeAccess { expr: lhs, name: s })
+            }
 
             // TODO: need to further disambiguating square brackets
             // see https://sanity-io.github.io/GROQ/draft/#sec-Disambiguating-square-bracket-traversal
-            Expression::Literal(LiteralKind::Int64(i)) => Expression::ElementAccess {
-                expr: Box::new(lhs),
-                index: Box::new(Expression::Literal(LiteralKind::Int64(i))),
-            },
+            ExpressionKind::Literal(LiteralKind::Int64(_)) => {
+                ExpressionKind::ElementAccess(ElementAccess {
+                    expr: lhs,
+                    index: parsed_expr,
+                })
+            }
 
-            constraint => Expression::FilterTraversal {
-                expr: Box::new(lhs),
-                constraint: Box::new(constraint),
-            },
+            ExpressionKind::BinaryOp(BinaryOp {
+                lhs,
+                operator: Operator::DotDot,
+                rhs,
+            }) => ExpressionKind::SliceTraversal(SliceTraversal {
+                range: ast::Range {
+                    start: lhs,
+                    end: rhs,
+                    inclusive: true,
+                },
+            }),
+
+            ExpressionKind::BinaryOp(BinaryOp {
+                lhs,
+                operator: Operator::DotDotDot,
+                rhs,
+            }) => ExpressionKind::SliceTraversal(SliceTraversal {
+                range: ast::Range {
+                    start: lhs,
+                    end: rhs,
+                    inclusive: false,
+                },
+            }),
+
+            _ => ExpressionKind::FilterTraversal(FilterTraversal {
+                expr: lhs,
+                constraint: parsed_expr,
+            }),
         };
 
         self.expect_token(Token::CloseBracket)?;
 
-        Ok(expr)
+        println!("-- end parse_bracket_expr");
+        Ok(make_expr(kind))
     }
 
     // Parses an expression inside braces, either an object or a projection
-    fn parse_brace_expr(&mut self, lhs: Option<Expression>) -> Result<ast::Expression, String> {
+    fn parse_brace_expr(
+        &mut self,
+        lhs: Option<Box<Expression>>,
+    ) -> Result<Box<Expression>, String> {
         self.expect_token(Token::OpenBrace)?;
 
         let mut entries = Vec::new();
@@ -190,13 +251,17 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            let attr = match self.parse_expression(0)? {
-                Expression::BinaryOp {
+            let parsed_expr = self.parse_expression(0)?;
+
+            println!("-- parse_brace_expr expr: {:?}", parsed_expr.kind);
+
+            let attr = match parsed_expr.kind {
+                ExpressionKind::BinaryOp(BinaryOp {
                     lhs,
                     operator: Operator::Colon,
                     rhs,
-                } => match *lhs {
-                    Expression::Literal(LiteralKind::String(s)) => {
+                }) => match lhs.kind {
+                    ExpressionKind::Literal(LiteralKind::String(s)) => {
                         ast::ObjectAttribute::AliasedExpression {
                             alias: s,
                             expr: rhs,
@@ -204,7 +269,7 @@ impl<'a> Parser<'a> {
                     }
                     _ => Err(format!("expected string literal, got {:?}", lhs))?,
                 },
-                expr => ast::ObjectAttribute::Expression(Box::new(expr)),
+                _ => ObjectAttribute::Expression(parsed_expr),
             };
 
             entries.push(attr);
@@ -216,20 +281,22 @@ impl<'a> Parser<'a> {
 
         self.expect_token(Token::CloseBrace)?;
 
-        let obj: ast::Object = ast::Object { entries };
+        let obj: Object = Object { entries };
 
         // none = no lhs, so we are parsing an object
-        match lhs {
-            Some(lhs) => Ok(Expression::Projection {
-                expr: Box::new(lhs),
+        Ok(make_expr(match lhs {
+            Some(lhs) => ExpressionKind::Projection(Projection {
+                expr: lhs,
                 object: obj,
             }),
-            None => Ok(Expression::Object(obj)),
-        }
+            None => ExpressionKind::Object(obj),
+        }))
     }
 
     // Parses an expression with an operator, either prefix or infix
-    fn parse_operator(&mut self, lhs: Expression) -> Result<ast::Expression, String> {
+    fn parse_operator(&mut self, lhs: Box<Expression>) -> Result<Box<Expression>, String> {
+        println!("-- parse_operator");
+
         let token = self.next_token();
 
         let op = match parse_token_operator(&token) {
@@ -240,50 +307,53 @@ impl<'a> Parser<'a> {
         let (_, rbp) = binding_power(&token, OperatorType::Infix);
         let rhs = self.parse_expression(rbp)?;
 
-        match op {
-            Operator::Dot => {
-                match (&lhs, &rhs) {
-                    // When rhs is a Attr, we can convert this into an attribute access traversal
-                    (_, Expression::Attr(rhs)) => Ok(Expression::AttributeAccess {
-                        expr: Box::new(lhs),
-                        name: rhs.to_string(),
-                    }),
+        println!("-- deets: {:?}, {:?}, {:?}", lhs, op, rhs);
 
-                    // TODO: is this valid, or should we error?
-                    _ => Ok(Expression::BinaryOp {
-                        lhs: Box::new(lhs),
-                        operator: Operator::Dot,
-                        rhs: Box::new(rhs),
+        let kind = match op {
+            Operator::Dot => {
+                match (&lhs.kind, &rhs.kind) {
+                    // When rhs is a Attr, we can convert this into an attribute access traversal
+                    (_, ExpressionKind::Attr(name)) => {
+                        ExpressionKind::AttributeAccess(AttributeAccess {
+                            expr: lhs,
+                            name: name.to_string(),
+                        })
+                    }
+
+                    _ => ExpressionKind::BinaryOp(BinaryOp {
+                        lhs,
+                        operator: op,
+                        rhs,
                     }),
                 }
             }
-            _ => Ok(Expression::BinaryOp {
-                lhs: Box::new(lhs),
+            _ => ExpressionKind::BinaryOp(BinaryOp {
+                lhs,
                 operator: op,
-                rhs: Box::new(rhs),
+                rhs,
             }),
-        }
+        };
+
+        println!("-- end parse_operator {:?}", kind);
+        Ok(make_expr(kind))
     }
 
     // Parses an deref traversal expression, e.g. foo->bar, or foo->
-    fn parse_arrow_deref(&mut self, lhs: Expression) -> Result<ast::Expression, String> {
+    fn parse_arrow_deref(&mut self, lhs: Box<Expression>) -> Result<Box<Expression>, String> {
         self.expect_token(Token::Arrow)?;
 
-        match self.peek_token().to_owned() {
+        let kind = match self.peek_token().to_owned() {
             Token::Identifier(s) => {
                 self.next_token();
 
-                Ok(Expression::AttributeAccess {
-                    expr: Box::new(Expression::Dereference {
-                        expr: Box::new(lhs),
-                    }),
+                ExpressionKind::AttributeAccess(AttributeAccess {
+                    expr: make_expr(ExpressionKind::Dereference(Dereference { expr: lhs })),
                     name: s,
                 })
             }
-            _ => Ok(Expression::Dereference {
-                expr: Box::new(lhs),
-            }),
-        }
+            _ => ExpressionKind::Dereference(Dereference { expr: lhs }),
+        };
+        Ok(make_expr(kind))
     }
 
     fn peek_token(&mut self) -> &Token {
@@ -337,6 +407,13 @@ fn is_prefix_operator(token: &Token) -> bool {
     }
 }
 
+fn is_postfix_operator(token: &Token) -> bool {
+    match token {
+        Token::EmptyBrackets => true,
+        _ => false,
+    }
+}
+
 fn parse_token_operator(token: &Token) -> Option<ast::Operator> {
     match token {
         Token::And => Some(ast::Operator::And),
@@ -355,6 +432,7 @@ fn parse_token_operator(token: &Token) -> Option<ast::Operator> {
         Token::Percent => Some(ast::Operator::Percent),
         Token::DoubleStar => Some(ast::Operator::DoubleStar),
         Token::Dot => Some(ast::Operator::Dot),
+        Token::Dots(2) => Some(ast::Operator::DotDot),
         Token::Dots(3) => Some(ast::Operator::DotDotDot),
         Token::Colon => Some(ast::Operator::Colon),
         _ => None,
@@ -365,6 +443,10 @@ enum OperatorType {
     Prefix,
     Infix,
     Postfix,
+}
+
+fn make_expr(kind: ExpressionKind) -> Box<Expression> {
+    Box::new(Expression { kind })
 }
 
 // Returns the left and right binding power for the given token and operator type
@@ -391,9 +473,12 @@ fn binding_power(token: &Token, op: OperatorType) -> (u8, u8) {
             _ => (0, 0),
         },
         OperatorType::Infix => match token {
-            Token::Colon => (10, 11), // For object attribute
-            Token::Or => (20, 21),    // Level 2, left-associative
-            Token::And => (30, 31),   // Level 3, left-associative
+            Token::Colon => (1, 2), // For object access
+            Token::Dot => (2, 3),   // For attribute access
+
+            // level 1 not implemented yet
+            Token::Or => (20, 21),  // Level 2, left-associative
+            Token::And => (30, 31), // Level 3, left-associative
             Token::Eq | Token::NotEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq => {
                 (40, 40)
             } // Level 4, non-associative
@@ -404,13 +489,28 @@ fn binding_power(token: &Token, op: OperatorType) -> (u8, u8) {
             // Level 11 not implemented yet
             _ => (0, 0),
         },
-        OperatorType::Postfix => (0, 0),
+        OperatorType::Postfix => match token {
+            Token::EmptyBrackets => (2, 0),
+            _ => (0, 0),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_binary_expr(
+        lhs: Box<Expression>,
+        operator: ast::Operator,
+        rhs: Box<Expression>,
+    ) -> Box<Expression> {
+        make_expr(ExpressionKind::BinaryOp(BinaryOp { lhs, operator, rhs }))
+    }
+
+    fn make_unary_expr(operator: ast::Operator, expr: Box<Expression>) -> Box<Expression> {
+        make_expr(ExpressionKind::UnaryOp(UnaryOp { operator, expr }))
+    }
 
     macro_rules! parser_test {
         ($($name:ident: $s:expr,)*) => {
@@ -429,675 +529,1089 @@ mod tests {
         }
     }
 
-    parser_test!(
-        attr_access: ("foo.bar", Expression::AttributeAccess { expr: Box::new(Expression::Attr("foo".to_string())), name: "bar".to_string() }),
+    mod simple_expressions_tests {
+        use super::*;
 
-        attr_access_bracket: ("foo[\"bar\"]", Expression::AttributeAccess { expr: Box::new(Expression::Attr("foo".to_string())), name: "bar".to_string() }),
+        parser_test!(
+            attr_access: ("foo.bar", make_expr(
+                ExpressionKind::AttributeAccess(AttributeAccess {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::Attr("foo".to_string())
+                    }),
+                    name: "bar".to_string()
+                }
+            ))),
 
-        attr_access_everything: ("*.bar", Expression::AttributeAccess { expr: Box::new(Expression::Everything), name: "bar".to_string() }),
+            attr_access_chain: ("foo.bar.baz.abc", make_expr(
+                ExpressionKind::AttributeAccess(AttributeAccess {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                            expr: Box::new(Expression {
+                                kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                    expr: Box::new(Expression {
+                                        kind: ExpressionKind::Attr("foo".to_string())
+                                    }),
+                                    name: "bar".to_string()
+                                })
+                            }),
+                            name: "baz".to_string()
+                        })
+                    }),
+                    name: "abc".to_string()
+                })
+            )),
 
-        attr_access_everything_bracket: ("*['bar']", Expression::AttributeAccess { expr: Box::new(Expression::Everything), name: "bar".to_string() }),
+            attr_access_bracket: ("foo[\"bar\"]", make_expr(
+                ExpressionKind::AttributeAccess(AttributeAccess {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::Attr("foo".to_string())
+                    }),
+                    name: "bar".to_string()
+                })
+            )),
 
-        attr_access_object: (
-            "{\"foo\": bar}.foo",
-            Expression::AttributeAccess {
-                expr: Box::new(Expression::Object(ast::Object {
-                    entries: vec![
-                        ast::ObjectAttribute::AliasedExpression{
-                            alias: "foo".to_string(),
-                            expr: Box::new(Expression::Attr("bar".to_string()))
+            attr_access_bracket_chain: ("foo[\"bar\"][\"baz\"][\"abc\"]", make_expr(
+                ExpressionKind::AttributeAccess(AttributeAccess {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                            expr: Box::new(Expression {
+                                kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                    expr: Box::new(Expression {
+                                        kind: ExpressionKind::Attr("foo".to_string())
+                                    }),
+                                    name: "bar".to_string()
+                                })
+                            }),
+                            name: "baz".to_string()
+                        })
+                    }),
+                    name: "abc".to_string()
+                })
+            )),
+
+            attr_access_everything: ("*.bar", make_expr(
+                ExpressionKind::AttributeAccess(AttributeAccess {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::Everything
+                    }),
+                    name: "bar".to_string()
+                })
+            )),
+
+            attr_access_everything_chain: ("*.foo.bar.baz", make_expr(
+                ExpressionKind::AttributeAccess(AttributeAccess {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                            expr: Box::new(Expression {
+                                kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                    expr: Box::new(Expression {
+                                        kind: ExpressionKind::Everything
+                                    }),
+                                    name: "foo".to_string()
+                                })
+                            }),
+                            name: "bar".to_string()
+                        })
+                    }),
+                    name: "baz".to_string()
+                })
+            )),
+
+            attr_access_everything_bracket: ("*['bar']", make_expr(
+                ExpressionKind::AttributeAccess(AttributeAccess {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::Everything
+                    }),
+                    name: "bar".to_string()
+                })
+            )),
+
+            attr_access_object: (
+                "{\"foo\": bar}.foo.baz",
+                make_expr(ExpressionKind::AttributeAccess(AttributeAccess {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::Object(ast::Object {
+                                        entries: vec![
+                                            ast::ObjectAttribute::AliasedExpression {
+                                                alias: "foo".to_string(),
+                                                expr: Box::new(Expression {
+                                                    kind: ExpressionKind::Attr("bar".to_string())
+                                                })
+                                            }
+                                        ]
+                                    })
+                                }),
+                                name: "foo".to_string()
+                            })
+                        }),
+                        name: "baz".to_string()
+                    })
+            )),
+
+            array_elements: ("[1, 2, 3]", make_expr(
+                ExpressionKind::ArrayElements(ArrayElements {
+                    elements: vec![
+                        Expression {
+                            kind: ExpressionKind::Literal(LiteralKind::Int64(1))
                         },
-                    ]})
-                ),
-                name: "foo".to_string()
-            }
-        ),
+                        Expression {
+                            kind: ExpressionKind::Literal(LiteralKind::Int64(2))
+                        },
+                        Expression {
+                            kind: ExpressionKind::Literal(LiteralKind::Int64(3))
+                        }
+                    ]
+                })
+            )),
 
-        array_elements: ("[1, 2, 3]", Expression::ArrayElements { elements: vec![Expression::Literal(LiteralKind::Int64(1)), Expression::Literal(LiteralKind::Int64(2)), Expression::Literal(LiteralKind::Int64(3))] }),
+            array_postfix: ("foo[]", make_expr(
+                ExpressionKind::ArrayPostfix(ArrayPostfix {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::Attr("foo".to_string())
+                    })
+                })
+            )),
 
-        array_postfix: ("foo[]", Expression::ArrayPostfix { expr: Box::new(Expression::Attr("foo".to_string())) }),
+            array_postfix_chain: (
+                "foo[].bar[]",
+                make_expr(ExpressionKind::ArrayPostfix(ArrayPostfix {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::ArrayPostfix(ArrayPostfix {
+                                        expr: Box::new(Expression {
+                                            kind: ExpressionKind::Attr("foo".to_string())
+                                        })
+                                    })
+                                }),
+                                name: "bar".to_string()
+                            })
+                        })
+                    })
+                )
+            ),
 
-        array_postfix_with_filter: (
-            "foo[bar == 'baz']",
-            Expression::FilterTraversal {
-                expr: Box::new(Expression::Attr("foo".to_string())),
-                constraint: Box::new(Expression::BinaryOp { lhs: Box::new(Expression::Attr("bar".to_string())), operator: Operator::Eq, rhs: Box::new(Expression::Literal(LiteralKind::String("baz".to_string())))
-            })
-        }),
+            filter_traversal: (
+                "foo[bar == 'baz']",
+                make_expr(ExpressionKind::FilterTraversal(FilterTraversal {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::Attr("foo".to_string())
+                        }),
+                        constraint: Box::new(Expression {
+                            kind: ExpressionKind::BinaryOp(BinaryOp {
+                                lhs: Box::new(Expression {
+                                    kind: ExpressionKind::Attr("bar".to_string())
+                                }),
+                                operator: Operator::Eq,
+                                rhs: Box::new(Expression {
+                                    kind: ExpressionKind::Literal(LiteralKind::String("baz".to_string()))
+                                })
+                            })
+                        })
+                    })
+                )
+            ),
 
-        array_chained_ints: (
-            "[1, 2, [3, 4, 5]][3][0]",
-            Expression::ElementAccess {
-                expr: Box::new(Expression::ElementAccess {
-                    expr: Box::new(Expression::ArrayElements {
-                        elements: vec![
-                            Expression::Literal(LiteralKind::Int64(1)),
-                            Expression::Literal(LiteralKind::Int64(2)),
-                            Expression::ArrayElements {
+            array_chained_ints: (
+                "[1, 2, [3, 4, 5]][3][0]",
+                make_expr(ExpressionKind::ElementAccess(ElementAccess {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::ElementAccess(ElementAccess {
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::ArrayElements(ArrayElements {
+                                        elements: vec![
+                                            Expression {
+                                                kind: ExpressionKind::Literal(LiteralKind::Int64(1))
+                                            },
+                                            Expression {
+                                                kind: ExpressionKind::Literal(LiteralKind::Int64(2))
+                                            },
+                                            Expression {
+                                                kind: ExpressionKind::ArrayElements(ArrayElements {
+                                                    elements: vec![
+                                                        Expression {
+                                                            kind: ExpressionKind::Literal(LiteralKind::Int64(3))
+                                                        },
+                                                        Expression {
+                                                            kind: ExpressionKind::Literal(LiteralKind::Int64(4))
+                                                        },
+                                                        Expression {
+                                                            kind: ExpressionKind::Literal(LiteralKind::Int64(5))
+                                                        }
+                                                    ]
+                                                })
+                                            }
+                                        ]
+                                    })
+                                }),
+                                index: Box::new(Expression {
+                                    kind: ExpressionKind::Literal(LiteralKind::Int64(3))
+                                })
+                            }),
+                        }),
+                        index: Box::new(Expression {
+                            kind: ExpressionKind::Literal(LiteralKind::Int64(0))
+                        })
+                    })
+                )
+            ),
+
+            array_bool: (
+                "[true, false, null][0]",
+                make_expr(ExpressionKind::ElementAccess(ElementAccess {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::ArrayElements(ArrayElements {
                                 elements: vec![
-                                    Expression::Literal(LiteralKind::Int64(3)),
-                                    Expression::Literal(LiteralKind::Int64(4)),
-                                    Expression::Literal(LiteralKind::Int64(5)),
+                                    Expression {
+                                        kind: ExpressionKind::Literal(LiteralKind::Boolean(true))
+                                    },
+                                    Expression {
+                                        kind: ExpressionKind::Literal(LiteralKind::Boolean(false))
+                                    },
+                                    Expression {
+                                        kind: ExpressionKind::Literal(LiteralKind::Null)
+                                    }
                                 ]
+                            })
+                        }),
+                        index: Box::new(Expression {
+                            kind: ExpressionKind::Literal(LiteralKind::Int64(0))
+                        })
+                    })
+                )
+            ),
+
+            object: (
+                "{\"foo\": bar, \"baz\": 2}",
+                make_expr(ExpressionKind::Object(Object {
+                        entries: vec![
+                            ObjectAttribute::AliasedExpression {
+                                alias: "foo".to_string(),
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::Attr("bar".to_string())
+                                })
+                            },
+                            ObjectAttribute::AliasedExpression {
+                                alias: "baz".to_string(),
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::Literal(LiteralKind::Int64(2))
+                                })
+                            },
+                        ]
+                    })
+                )
+            ),
+
+            object_nested: (
+                "{\"foo\": {\"bar\": 2}}",
+                make_expr(ExpressionKind::Object(Object {
+                        entries: vec![
+                            ObjectAttribute::AliasedExpression {
+                                alias: "foo".to_string(),
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::Object(Object {
+                                        entries: vec![
+                                            ObjectAttribute::AliasedExpression {
+                                                alias: "bar".to_string(),
+                                                expr: Box::new(Expression {
+                                                    kind: ExpressionKind::Literal(LiteralKind::Int64(2))
+                                                })
+                                            }
+                                        ]
+                                    })
+                                })
                             }
                         ]
-                    }),
-                    index: Box::new(Expression::Literal(LiteralKind::Int64(3))),
-                }),
-                index: Box::new(Expression::Literal(LiteralKind::Int64(0))),
-            }
-        ),
+                    })
+                )
+            ),
 
-        array_bool: (
-            "[true, false, null][0]",
-            Expression::ElementAccess {
-                expr: Box::new(Expression::ArrayElements {
-                    elements: vec![
-                        Expression::Literal(LiteralKind::Boolean(true)),
-                        Expression::Literal(LiteralKind::Boolean(false)),
-                        Expression::Literal(LiteralKind::Null),
-                    ]
-                }),
-                index: Box::new(Expression::Literal(LiteralKind::Int64(0))),
-            }
-        ),
+            dereference: (
+                "foo->bar",
+                make_expr(ExpressionKind::AttributeAccess(AttributeAccess {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::Dereference(Dereference {
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::Attr("foo".to_string())
+                                })
+                            })
+                        }),
+                        name: "bar".to_string()
+                    })
+                )
+            ),
 
-        object: (
-            "{\"foo\": bar, \"baz\": 2}",
-            Expression::Object(ast::Object {
-                entries: vec![
-                    ast::ObjectAttribute::AliasedExpression {
-                        alias: "foo".to_string(),
-                        expr: Box::new(Expression::Attr("bar".to_string()))
-                    },
-                    ast::ObjectAttribute::AliasedExpression {
-                        alias: "baz".to_string(),
-                        expr: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                    },
-                ]
-            })
-        ),
+            dereference_nested_array: (
+                "bar[]->meta->title.en",
+                make_expr(ExpressionKind::AttributeAccess(AttributeAccess {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::Dereference(Dereference {
+                                        expr: Box::new(Expression {
+                                            kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                                expr: Box::new(Expression {
+                                                    kind: ExpressionKind::Dereference(Dereference {
+                                                        expr: Box::new(Expression {
+                                                            kind: ExpressionKind::ArrayPostfix(ArrayPostfix {
+                                                                expr: Box::new(Expression {
+                                                                    kind: ExpressionKind::Attr("bar".to_string())
+                                                                })
+                                                            })
+                                                        })
+                                                    })
+                                                }),
+                                                name: "meta".to_string()
+                                            })
+                                        })
+                                    })
+                                }),
+                                name: "title".to_string()
+                            })
+                        }),
+                        name: "en".to_string()
+                    })
+                )
+            ),
 
-        object_nested: (
-            "{\"foo\": {\"bar\": 2}}",
-            Expression::Object(ast::Object {
-                entries: vec![
-                    ast::ObjectAttribute::AliasedExpression {
-                        alias: "foo".to_string(),
-                        expr: Box::new(Expression::Object(ast::Object {
+            dereference_projection: (
+                "foo->{bar, baz}",
+                make_expr(ExpressionKind::Projection(Projection {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::Dereference(Dereference {
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::Attr("foo".to_string())
+                                })
+                            })
+                        }),
+                        object: ast::Object {
                             entries: vec![
-                                ast::ObjectAttribute::AliasedExpression {
-                                    alias: "bar".to_string(),
-                                    expr: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                                }
+                                ast::ObjectAttribute::Expression(Box::new(Expression {
+                                    kind: ExpressionKind::Attr("bar".to_string())
+                                })),
+                                ast::ObjectAttribute::Expression(Box::new(Expression {
+                                    kind: ExpressionKind::Attr("baz".to_string())
+                                })),
                             ]
-                        }))
-                    }
-                ]
-            })
-        ),
+                        }
+                    })
+                )
+            ),
 
-        dereference: (
-            "foo->bar",
-            Expression::AttributeAccess {
-                expr: Box::new(Expression::Dereference { expr: Box::new(Expression::Attr("foo".to_string())) }),
-                name: "bar".to_string()
-            },
-        ),
+            dereference_projection_attr_access: (
+                "foo->{bar, baz}.bar",
+                make_expr(ExpressionKind::AttributeAccess(AttributeAccess {
+                        expr: Box::new(Expression {
+                            kind: ExpressionKind::Projection(Projection {
+                                expr: Box::new(Expression {
+                                    kind: ExpressionKind::Dereference(Dereference {
+                                        expr: Box::new(Expression {
+                                            kind: ExpressionKind::Attr("foo".to_string())
+                                        })
+                                    })
+                                }),
+                                object: ast::Object {
+                                    entries: vec![
+                                        ast::ObjectAttribute::Expression(Box::new(Expression {
+                                            kind: ExpressionKind::Attr("bar".to_string())
+                                        })),
+                                        ast::ObjectAttribute::Expression(Box::new(Expression {
+                                            kind: ExpressionKind::Attr("baz".to_string())
+                                        })),
+                                    ]
+                                }
+                            })
+                        }),
+                        name: "bar".to_string()
+                    })
+                )
+            ),
 
-        dereference_nested_array: (
-            "bar[]->meta->title.en",
-            Expression::AttributeAccess {
-                expr: Box::new(Expression::AttributeAccess {
-                    expr: Box::new(Expression::Dereference {
-                        expr: Box::new(Expression::AttributeAccess {
-                            expr: Box::new(Expression::Dereference {
-                                expr: Box::new(Expression::ArrayPostfix { expr: Box::new(Expression::Attr("bar".to_string())) })
+            ranged_slice_incl: (
+                "foo[1..3]",
+                make_expr(ExpressionKind::SliceTraversal(SliceTraversal {
+                        range: ast::Range {
+                            start: Box::new(Expression {
+                                kind: ExpressionKind::Literal(LiteralKind::Int64(1))
                             }),
-                            name: "meta".to_string()
-                        })
-                    }),
-                    name: "title".to_string()
-                }),
-                name: "en".to_string()
-            }
-        ),
+                            end: Box::new(Expression {
+                                kind: ExpressionKind::Literal(LiteralKind::Int64(3))
+                            }),
+                            inclusive: true
+                        }
+                    })
+                )
+            ),
 
-        dereference_projection: (
-            "foo->{bar, baz}",
-            Expression::Projection {
-                expr: Box::new(Expression::Dereference { expr: Box::new(Expression::Attr("foo".to_string())) }),
-                object: ast::Object {
+            ranged_slice_excl: (
+                "foo[1...3]",
+                make_expr(ExpressionKind::SliceTraversal(SliceTraversal {
+                        range: ast::Range {
+                            start: Box::new(Expression {
+                                kind: ExpressionKind::Literal(LiteralKind::Int64(1))
+                            }),
+                            end: Box::new(Expression {
+                                kind: ExpressionKind::Literal(LiteralKind::Int64(3))
+                            }),
+                            inclusive: false
+                        }
+                    })
+                )
+            ),
+
+            // TODO: needs impl
+            // ranged_filter: (
+            //     "foo[bar == foo..bar]",
+            //     Expression {
+            //     }
+            // ),
+        );
+    }
+
+    mod precedence_associativity_tests {
+        use super::*;
+
+        // Tests for precedence and associativity
+        // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#sec-Precedence-and-associativity
+        // Level 11: Compound expressions.
+        // Level 10, prefix: +, !.
+        // Level 9, right-associative: **.
+        // Level 8, prefix: -.
+        // Level 7, left-associative: Multiplicatives (*, /, %).
+        // Level 6, left-associative: Additives (+, -).
+        // Level 5, non-associative: Ranges (.., ...).
+        // Level 4, non-associative: Comparisons (==, !=, >, >=,<, <=, in, match).
+        // Level 4, postfix: Ordering (asc, desc).
+        // Level 3, left-associative: &&.
+        // Level 2, left-associative: ||.
+        // Level 1, non-associative: =>.
+        parser_test!(
+            // => is not implemented yet
+            // level_1:
+
+            level_2: (
+                "true || false || true",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true))),
+                        Operator::Or,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(false)))
+                    ),
+                    Operator::Or,
+                    make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true)))
+                )
+            ),
+
+            level_3: (
+                "true && false && true",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true))),
+                        Operator::And,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(false)))
+                    ),
+                    Operator::And,
+                    make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true)))
+                )
+            ),
+
+            level_3_2: (
+                "true || false && false || true",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true))),
+                        Operator::Or,
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Boolean(false))),
+                            Operator::And,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Boolean(false)))
+                        )
+                    ),
+                    Operator::Or,
+                    make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true)))
+                )
+            ),
+
+            level_3_2a: (
+                "true && false || false && true",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true))),
+                        Operator::And,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(false)))
+                    ),
+                    Operator::Or,
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(false))),
+                        Operator::And,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true)))
+                    )
+                )
+            ),
+
+            level_4_ands: (
+                "1 == 2 && 3 != 4 && 5 > 6 && 7 >= 8 && 9 < 10 && 11 <= 12",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_binary_expr(
+                                make_binary_expr(
+                                    make_binary_expr(
+                                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                                        Operator::Eq,
+                                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                                    ),
+                                    Operator::And,
+                                    make_binary_expr(
+                                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))),
+                                        Operator::NotEq,
+                                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(4)))
+                                    )
+                                ),
+                                Operator::And,
+                                make_binary_expr(
+                                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(5))),
+                                    Operator::Gt,
+                                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(6)))
+                                )
+                            ),
+                            Operator::And,
+                            make_binary_expr(
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(7))),
+                                Operator::GtEq,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(8)))
+                            )
+                        ),
+                        Operator::And,
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(9))),
+                            Operator::Lt,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(10)))
+                        )
+                    ),
+                    Operator::And,
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(11))),
+                        Operator::LtEq,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(12)))
+                    )
+                ),
+            ),
+
+            level_4_ors: (
+                "1 == 2 || 3 != 4 || 5 > 6 || 7 >= 8 || 9 < 10 || 11 <= 12",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_binary_expr(
+                                make_binary_expr(
+                                    make_binary_expr(
+                                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                                        Operator::Eq,
+                                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                                    ),
+                                    Operator::Or,
+                                    make_binary_expr(
+                                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))),
+                                        Operator::NotEq,
+                                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(4)))
+                                    )
+                                ),
+                                Operator::Or,
+                                make_binary_expr(
+                                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(5))),
+                                    Operator::Gt,
+                                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(6)))
+                                )
+                            ),
+                            Operator::Or,
+                            make_binary_expr(
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(7))),
+                                Operator::GtEq,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(8)))
+                            )
+                        ),
+                        Operator::Or,
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(9))),
+                            Operator::Lt,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(10)))
+                        )
+                    ),
+                    Operator::Or,
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(11))),
+                        Operator::LtEq,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(12)))
+                    )
+                ),
+            ),
+
+            level_4_ands_ors: (
+                "1 == 2 && 3 != 4 || 5 > 6 && 7 >= 8 || 9 < 10 && 11 <= 12",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_binary_expr(
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                                Operator::Eq,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(2))
+                            )),
+                            Operator::And,
+                            make_binary_expr(
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))),
+                                Operator::NotEq,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(4))
+                            )
+                        )),
+                        Operator::Or,
+                        make_binary_expr(
+                            make_binary_expr(
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(5))),
+                                Operator::Gt,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(6))
+                            )),
+                            Operator::And,
+                            make_binary_expr(
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(7))),
+                                Operator::GtEq,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(8)))
+                            )
+                        )
+                    ),
+                    Operator::Or,
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(9))),
+                            Operator::Lt,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(10))
+                        )),
+                        Operator::And,
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(11))),
+                            Operator::LtEq,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(12)))
+                        )
+                    )
+                ),
+            ),
+
+            // // Rang(.., ...) not implemented yet
+            // // level_5:
+
+            level_6: (
+                "1 + 2 - 3 + 4",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                            Operator::Plus,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(2))
+                        )),
+                        Operator::Minus,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))
+                    )),
+                    Operator::Plus,
+                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(4)))
+                )
+            ),
+
+            level_6_2: (
+                "1 + 2 || 3 - 4 && 5 + 6",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                        Operator::Plus,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                    ),
+                    Operator::Or,
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))),
+                            Operator::Minus,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(4)))
+                        ),
+                        Operator::And,
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(5))),
+                            Operator::Plus,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(6)))
+                        )
+                    )
+                ),
+            ),
+
+            level_7: (
+                "1 * 2 / 3 % 4",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                            Operator::Star,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                        ),
+                        Operator::Slash,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(3)))
+                    ),
+                    Operator::Percent,
+                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(4)))
+                ),
+            ),
+
+            level_7_6: (
+                "1 * 2 / 3 + 4 * 5 % 6",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                            Operator::Star,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                        ),
+                        Operator::Slash,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(3)))
+                    ),
+                    Operator::Plus,
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(4))),
+                            Operator::Star,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(5)))
+                        ),
+                        Operator::Percent,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(6)))
+                    )
+                )
+            ),
+
+            level_7_2_3: (
+                "1 * 2 || 3 / 4 && 5 * 6",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                        Operator::Star,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                    ),
+                    Operator::Or,
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))),
+                            Operator::Slash,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(4)))
+                        ),
+                        Operator::And,
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(5))),
+                            Operator::Star,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(6)))
+                        )
+                    )
+                ),
+            ),
+
+            level_8: (
+                "+1 - 2",
+                make_binary_expr(
+                    make_unary_expr(
+                        Operator::Plus,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))
+                    )),
+                    Operator::Minus,
+                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                )
+            ),
+
+            level_8_7: (
+                "+1 * 2 - -3 / 4",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_unary_expr(
+                            Operator::Plus,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))
+                        )),
+                        Operator::Star,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                    ),
+                    Operator::Minus,
+                    make_binary_expr(
+                        make_unary_expr(
+                            Operator::Minus,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))
+                        )),
+                        Operator::Slash,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(4)))
+                    )
+                )
+            ),
+
+            level_8_2_3: (
+                "+1 || 2 - -3 && 4",
+                make_binary_expr(
+                    make_unary_expr(
+                        Operator::Plus,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))
+                    )),
+                    Operator::Or,
+                    make_binary_expr(
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(2))),
+                            Operator::Minus,
+                            make_unary_expr(
+                                Operator::Minus,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(3)))
+                            )
+                        ),
+                        Operator::And,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(4)))
+                    )
+                )
+            ),
+
+            level_9: (
+                "1 ** 2 ** 3",
+                make_binary_expr(
+                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                    Operator::DoubleStar,
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(2))),
+                        Operator::DoubleStar,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(3)))
+                    )
+                )
+            ),
+
+            level_9_8: (
+                "1 ** +2 ** -3",
+                make_binary_expr(
+                    make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                    Operator::DoubleStar,
+                    make_unary_expr(
+                        Operator::Plus,
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(2))),
+                            Operator::DoubleStar,
+                            make_unary_expr(
+                                Operator::Minus,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Int64(3)))
+                            )
+                        )
+                    ),
+                ),
+            ),
+
+            level_9_8_2: (
+                "1 ** +2 || -3 ** 4",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                        Operator::DoubleStar,
+                        make_unary_expr(
+                            Operator::Plus,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(2))
+                        )),
+                    ),
+                    Operator::Or,
+                    make_unary_expr(
+                        Operator::Minus,
+                        make_binary_expr(
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))),
+                            Operator::DoubleStar,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Int64(4))
+                        )),
+                    ),
+                ),
+            ),
+
+            level_10: (
+                "!true",
+                make_unary_expr(
+                    Operator::Not,
+                    make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true)))
+                )
+            ),
+
+            level_10_2_3: (
+                "!true || !false && !true || true",
+                make_binary_expr(
+                    make_binary_expr(
+                        make_unary_expr(
+                            Operator::Not,
+                            make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true)))
+                        ),
+                        Operator::Or,
+                        make_binary_expr(
+                            make_unary_expr(
+                                Operator::Not,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Boolean(false)))
+                            ),
+                            Operator::And,
+                            make_unary_expr(
+                                Operator::Not,
+                                make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true)))
+                            ),
+                        ),
+                    ),
+                    Operator::Or,
+                    make_expr(ExpressionKind::Literal(LiteralKind::Boolean(true)))
+                ),
+            ),
+        );
+    }
+
+    mod misc_tests {
+        use super::*;
+
+        parser_test!(
+            projection_join: (
+                "{\"everything\": *[_type == 'foo']}",
+                make_expr(ExpressionKind::Object(Object {
                     entries: vec![
-                        ast::ObjectAttribute::Expression(Box::new(Expression::Attr("bar".to_string()))),
-                        ast::ObjectAttribute::Expression(Box::new(Expression::Attr("baz".to_string()))),
+                        ObjectAttribute::AliasedExpression {
+                            alias: "everything".to_string(),
+                            expr: make_expr(
+                                ExpressionKind::FilterTraversal(FilterTraversal {
+                                    expr: make_expr(ExpressionKind::Everything),
+                                    constraint: make_binary_expr(
+                                        make_expr(ExpressionKind::Attr("_type".to_string())),
+                                        Operator::Eq,
+                                        make_expr(ExpressionKind::Literal(LiteralKind::String("foo".to_string())))
+                                    )
+                                })
+                            )
+                        }
                     ]
-                }
-            }
-        ),
+                })
+            )),
 
-        dereference_projection_attr_access: (
-            "foo->{bar, baz}.bar",
-            Expression::AttributeAccess {
-                expr: Box::new(Expression::Projection {
-                    expr: Box::new(Expression::Dereference { expr: Box::new(Expression::Attr("foo".to_string())) }),
-                    object: ast::Object {
-                        entries: vec![
-                            ast::ObjectAttribute::Expression(Box::new(Expression::Attr("bar".to_string()))),
-                            ast::ObjectAttribute::Expression(Box::new(Expression::Attr("baz".to_string()))),
-                        ]
+            projection_nested: (
+                r#"
+                    {
+                        "everything": *[_type == 'foo'] {
+                            "metadata": bar[]->meta->title.en,
+                            "a": 1,
+                            "b": {
+                                "c": c->{
+                                    "d": d[]
+                                }
+                            },
+                            empty
+                        }
                     }
-                }),
-                name: "bar".to_string()
-            }
-        ),
-
-        // TODO: Need implementation for this
-        ranged_slice_exl: (
-            "foo[1..3]",
-            Expression::SliceTraversal {
-                range: ast::Range {
-                    start: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                    end: Box::new(Expression::Literal(LiteralKind::Int64(3))),
-                    inclusive: false,
-                }
-            }
-        ),
-    );
-
-    // Tests for precedence and associativity
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#sec-Precedence-and-associativity
-    // Level 11: Compound expressions.
-    // Level 10, prefix: +, !.
-    // Level 9, right-associative: **.
-    // Level 8, prefix: -.
-    // Level 7, left-associative: Multiplicatives (*, /, %).
-    // Level 6, left-associative: Additives (+, -).
-    // Level 5, non-associative: Ranges (.., ...).
-    // Level 4, non-associative: Comparisons (==, !=, >, >=,<, <=, in, match).
-    // Level 4, postfix: Ordering (asc, desc).
-    // Level 3, left-associative: &&.
-    // Level 2, left-associative: ||.
-    // Level 1, non-associative: =>.
-    parser_test!(
-        // => is not implemented yet
-        // level_1:
-
-        level_2: (
-            "true || false || true",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(true))),
-                    operator: Operator::Or,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
-            }
-        ),
-
-        level_3: (
-            "true && false && true",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(true))),
-                    operator: Operator::And,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
-                }),
-                operator: Operator::And,
-                rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
-            }
-        ),
-
-        level_3_2: (
-            "true || false && false || true",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(true))),
-                    operator: Operator::Or,
-                    rhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Boolean(false))),
-                        operator: Operator::And,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
-                    })
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
-            }
-        ),
-
-        level_3_2a: (
-            "true && false || false && true",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(true))),
-                    operator: Operator::And,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Boolean(false))),
-                    operator: Operator::And,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
-                })
-            }
-        ),
-
-        level_4_ands: (
-            "1 == 2 && 3 != 4 && 5 > 6 && 7 >= 8 && 9 < 10 && 11 <= 12",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::BinaryOp {
-                            lhs: Box::new(Expression::BinaryOp {
-                                lhs: Box::new(Expression::BinaryOp {
-                                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                                    operator: Operator::Eq,
-                                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                                }),
-                                operator: Operator::And,
-                                rhs: Box::new(Expression::BinaryOp {
-                                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
-                                    operator: Operator::NotEq,
-                                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
+                "#,
+                make_expr(ExpressionKind::Object(Object {
+                    entries: vec![
+                        ObjectAttribute::AliasedExpression {
+                            alias: "everything".to_string(),
+                            expr: Box::new(Expression {
+                                kind: ExpressionKind::Projection(Projection {
+                                    expr: Box::new(Expression {
+                                        kind: ExpressionKind::FilterTraversal(FilterTraversal {
+                                            expr: Box::new(Expression {
+                                                kind: ExpressionKind::Everything
+                                            }),
+                                            constraint: Box::new(Expression {
+                                                kind: ExpressionKind::BinaryOp(BinaryOp {
+                                                    lhs: Box::new(Expression {
+                                                        kind: ExpressionKind::Attr("_type".to_string())
+                                                    }),
+                                                    operator: Operator::Eq,
+                                                    rhs: Box::new(Expression {
+                                                        kind: ExpressionKind::Literal(LiteralKind::String("foo".to_string()))
+                                                    })
+                                                })
+                                            })
+                                        })
+                                    }),
+                                    object: ast::Object {
+                                        entries: vec![
+                                            ast::ObjectAttribute::AliasedExpression {
+                                                alias: "metadata".to_string(),
+                                                expr: make_expr(ExpressionKind::AttributeAccess(AttributeAccess {
+                                                    expr: Box::new(Expression {
+                                                        kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                                            expr: Box::new(Expression {
+                                                                kind: ExpressionKind::Dereference(Dereference {
+                                                                    expr: Box::new(Expression {
+                                                                        kind: ExpressionKind::AttributeAccess(AttributeAccess {
+                                                                            expr: Box::new(Expression {
+                                                                                kind: ExpressionKind::Dereference(Dereference {
+                                                                                    expr: Box::new(Expression {
+                                                                                        kind: ExpressionKind::ArrayPostfix(ArrayPostfix {
+                                                                                            expr: Box::new(Expression {
+                                                                                                kind: ExpressionKind::Attr("bar".to_string())
+                                                                                            })
+                                                                                        })
+                                                                                    })
+                                                                                })
+                                                                            }),
+                                                                            name: "meta".to_string()
+                                                                        })
+                                                                    })
+                                                                })
+                                                            }),
+                                                            name: "title".to_string()
+                                                        })
+                                                    }),
+                                                    name: "en".to_string()
+                                                }))
+                                            },
+                                            ast::ObjectAttribute::AliasedExpression {
+                                                alias: "a".to_string(),
+                                                expr: make_expr(ExpressionKind::Literal(LiteralKind::Int64(1)))
+                                            },
+                                            ast::ObjectAttribute::AliasedExpression {
+                                                alias: "b".to_string(),
+                                                expr: make_expr(ExpressionKind::Object(Object {
+                                                    entries: vec![
+                                                        ObjectAttribute::AliasedExpression {
+                                                            alias: "c".to_string(),
+                                                            expr: make_expr(ExpressionKind::Projection(Projection {
+                                                                expr: make_expr(ExpressionKind::Dereference(Dereference {
+                                                                    expr: make_expr(ExpressionKind::Attr("c".to_string()))
+                                                                })),
+                                                                object: ast::Object {
+                                                                    entries: vec![
+                                                                        ast::ObjectAttribute::AliasedExpression {
+                                                                            alias: "d".to_string(),
+                                                                            expr: make_expr(ExpressionKind::ArrayPostfix(ArrayPostfix {
+                                                                                expr: make_expr(ExpressionKind::Attr("d".to_string()))
+                                                                            }))
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            }))
+                                                        }
+                                                    ]
+                                                })),
+                                            },
+                                            ast::ObjectAttribute::Expression(make_expr(ExpressionKind::Attr("empty".to_string())))
+                                        ]
+                                    }
                                 })
-                            }),
-                            operator: Operator::And,
-                            rhs: Box::new(Expression::BinaryOp {
-                                lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
-                                operator: Operator::Gt,
-                                rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
                             })
-                        }),
-                        operator: Operator::And,
-                        rhs: Box::new(Expression::BinaryOp {
-                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(7))),
-                            operator: Operator::GtEq,
-                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(8)))
-                        })
-                    }),
-                    operator: Operator::And,
-                    rhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(9))),
-                        operator: Operator::Lt,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(10)))
-                    })
-                }),
-                operator: Operator::And,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(11))),
-                    operator: Operator::LtEq,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(12)))
-                }),
-            }
-        ),
-
-        level_4_ors: (
-            "1 == 2 || 3 != 4 || 5 > 6 || 7 >= 8 || 9 < 10 || 11 <= 12",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::BinaryOp {
-                            lhs: Box::new(Expression::BinaryOp {
-                                lhs: Box::new(Expression::BinaryOp {
-                                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                                    operator: Operator::Eq,
-                                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                                }),
-                                operator: Operator::Or,
-                                rhs: Box::new(Expression::BinaryOp {
-                                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
-                                    operator: Operator::NotEq,
-                                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-                                })
-                            }),
-                            operator: Operator::Or,
-                            rhs: Box::new(Expression::BinaryOp {
-                                lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
-                                operator: Operator::Gt,
-                                rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
-                            })
-                        }),
-                        operator: Operator::Or,
-                        rhs: Box::new(Expression::BinaryOp {
-                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(7))),
-                            operator: Operator::GtEq,
-                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(8)))
-                        })
-                    }),
-                    operator: Operator::Or,
-                    rhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(9))),
-                        operator: Operator::Lt,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(10)))
-                    })
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(11))),
-                    operator: Operator::LtEq,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(12)))
-                }),
-            }
-        ),
-
-        level_4_ands_ors: (
-            "1 == 2 && 3 != 4 || 5 > 6 && 7 >= 8 || 9 < 10 && 11 <= 12",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::BinaryOp {
-                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                            operator: Operator::Eq,
-                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                        }),
-                        operator: Operator::And,
-                        rhs: Box::new(Expression::BinaryOp {
-                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
-                            operator: Operator::NotEq,
-                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-                        })
-                    }),
-                    operator: Operator::Or,
-                    rhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::BinaryOp {
-                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
-                            operator: Operator::Gt,
-                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
-                        }),
-                        operator: Operator::And,
-                        rhs: Box::new(Expression::BinaryOp {
-                            lhs: Box::new(Expression::Literal(LiteralKind::Int64(7))),
-                            operator: Operator::GtEq,
-                            rhs: Box::new(Expression::Literal(LiteralKind::Int64(8)))
-                        })
-                    })
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(9))),
-                        operator: Operator::Lt,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(10)))
-                    }),
-                    operator: Operator::And,
-                    rhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(11))),
-                        operator: Operator::LtEq,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(12)))
-                    })
-                }),
-            }
-        ),
-
-        // Rang(.., ...) not implemented yet
-        // level_5:
-
-        level_6: (
-            "1 + 2 - 3 + 4",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                        operator: Operator::Plus,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                    }),
-                    operator: Operator::Minus,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(3)))
-                }),
-                operator: Operator::Plus,
-                rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-            }
-        ),
-
-        level_6_2: (
-            "1 + 2 || 3 - 4 && 5 + 6",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                    operator: Operator::Plus,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
-                        operator: Operator::Minus,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-                    }),
-                    operator: Operator::And,
-                    rhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
-                        operator: Operator::Plus,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
-                    })
+                        },
+                    ]
                 })
-            }
-        ),
-
-        level_7: (
-            "1 * 2 / 3 % 4",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                        operator: Operator::Star,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                    }),
-                    operator: Operator::Slash,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(3)))
-                }),
-                operator: Operator::Percent,
-                rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-            }
-        ),
-
-        level_7_6: (
-            "1 * 2 / 3 + 4 * 5 % 6",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                        operator: Operator::Star,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                    }),
-                    operator: Operator::Slash,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(3)))
-                }),
-                operator: Operator::Plus,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(4))),
-                        operator: Operator::Star,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(5)))
-                    }),
-                    operator: Operator::Percent,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
-                })
-            }
-        ),
-
-        level_7_2_3: (
-            "1 * 2 || 3 / 4 && 5 * 6",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                    operator: Operator::Star,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
-                        operator: Operator::Slash,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-                    }),
-                    operator: Operator::And,
-                    rhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(5))),
-                        operator: Operator::Star,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(6)))
-                    })
-                })
-            }
-        ),
-
-        level_8: (
-            "+1 - 2",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::UnaryOp {
-                    operator: Operator::Plus,
-                    expr: Box::new(Expression::Literal(LiteralKind::Int64(1)))
-                }),
-                operator: Operator::Minus,
-                rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-            }
-        ),
-
-        level_8_7: (
-            "+1 * 2 - -3 / 4",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::UnaryOp {
-                        operator: Operator::Plus,
-                        expr: Box::new(Expression::Literal(LiteralKind::Int64(1)))
-                    }),
-                    operator: Operator::Star,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                }),
-                operator: Operator::Minus,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::UnaryOp {
-                        operator: Operator::Minus,
-                        expr: Box::new(Expression::Literal(LiteralKind::Int64(3)))
-                    }),
-                    operator: Operator::Slash,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-                })
-            }
-        ),
-
-        level_8_2_3: (
-            "+1 || 2 - -3 && 4",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::UnaryOp {
-                    operator: Operator::Plus,
-                    expr: Box::new(Expression::Literal(LiteralKind::Int64(1)))
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(2))),
-                        operator: Operator::Minus,
-                        rhs: Box::new(Expression::UnaryOp {
-                            operator: Operator::Minus,
-                            expr: Box::new(Expression::Literal(LiteralKind::Int64(3)))
-                        }),
-                    }),
-                    operator: Operator::And,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-                })
-            }
-        ),
-
-        level_9: (
-            "1 ** 2 ** 3",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                operator: Operator::DoubleStar,
-                rhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(2))),
-                    operator: Operator::DoubleStar,
-                    rhs: Box::new(Expression::Literal(LiteralKind::Int64(3)))
-                })
-            }
-        ),
-
-        level_9_8: (
-            "1 ** +2 ** -3",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                operator: Operator::DoubleStar,
-                rhs: Box::new(Expression::UnaryOp {
-                    operator: Operator::Plus,
-                    expr: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(2))),
-                        operator: Operator::DoubleStar,
-                        rhs: Box::new(Expression::UnaryOp {
-                            operator: Operator::Minus,
-                            expr: Box::new(Expression::Literal(LiteralKind::Int64(3)))
-                        })
-                    })
-                })
-            }
-        ),
-
-        level_9_8_2: (
-            "1 ** +2 || -3 ** 4",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::Literal(LiteralKind::Int64(1))),
-                    operator: Operator::DoubleStar,
-                    rhs: Box::new(Expression::UnaryOp {
-                        operator: Operator::Plus,
-                        expr: Box::new(Expression::Literal(LiteralKind::Int64(2)))
-                    }),
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::UnaryOp {
-                    operator: Operator::Minus,
-                    expr: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::Literal(LiteralKind::Int64(3))),
-                        operator: Operator::DoubleStar,
-                        rhs: Box::new(Expression::Literal(LiteralKind::Int64(4)))
-                    })
-                })
-            }
-        ),
-
-        level_10: (
-            "!true",
-            Expression::UnaryOp {
-                operator: Operator::Not,
-                expr: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
-            }
-        ),
-
-        level_10_2_3: (
-            "!true || !false && !true || true",
-            Expression::BinaryOp {
-                lhs: Box::new(Expression::BinaryOp {
-                    lhs: Box::new(Expression::UnaryOp {
-                        operator: Operator::Not,
-                        expr: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
-                    }),
-                    operator: Operator::Or,
-                    rhs: Box::new(Expression::BinaryOp {
-                        lhs: Box::new(Expression::UnaryOp {
-                            operator: Operator::Not,
-                            expr: Box::new(Expression::Literal(LiteralKind::Boolean(false)))
-                        }),
-                        operator: Operator::And,
-                        rhs: Box::new(Expression::UnaryOp {
-                            operator: Operator::Not,
-                            expr: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
-                        }),
-                    })
-                }),
-                operator: Operator::Or,
-                rhs: Box::new(Expression::Literal(LiteralKind::Boolean(true)))
-            }
-        ),
-    );
+            )),
+        );
+    }
 
     #[test]
     fn test_print_output() {
         let lex: Lexer<'_> = Lexer::new(
             r#"
             {
-                "foo": "bar",
-                "everything": *[_type == 'foo'],
-                "metadata": bar[]->meta->title.en
+                "everything": *[_type == 'foo'] {
+                    "metadata": bar[]->meta->title.en,
+                    "a": 1,
+                    "b": {
+                        "c": c->{
+                            "d": d[]
+                        }
+                    },
+                    empty
+                }
             }
         "#,
         );

@@ -1,78 +1,97 @@
 #[derive(Debug, PartialEq)]
-pub enum Expression {
+pub struct Expression {
+    pub kind: ExpressionKind
+    // TODO: Add position information
+}
 
-    // Traversals...
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#TraversalExpression
-
-
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#AttributeAccess
-    AttributeAccess {
-        expr: Box<Expression>,
-        name: String,
-    },
-
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Dereference
-    Dereference {
-        expr: Box<Expression>,
-    },
-
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Slice
-    SliceTraversal {
-        range: Range,
-    },
-
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Filter
-    FilterTraversal {
-        expr: Box<Expression>,
-        constraint: Box<Expression>,
-    },
-
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#ElementAccess
-    ElementAccess {
-        expr: Box<Expression>,
-        index: Box<Expression>,
-    },
-
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#ArrayPostfix
-    ArrayPostfix {
-        expr: Box<Expression>,
-    },
-
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Projection
-    Projection {
-        expr: Box<Expression>,
-        object: Object,
-    },
-
-    // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#ArrayElements
-    ArrayElements {
-        elements: Vec<Expression>,
-    },
-
+#[derive(Debug, PartialEq)]
+pub enum ExpressionKind {
+    AttributeAccess(AttributeAccess),
+    Dereference(Dereference),
+    SliceTraversal(SliceTraversal),
+    FilterTraversal(FilterTraversal),
+    ElementAccess(ElementAccess),
+    ArrayPostfix(ArrayPostfix),
+    Projection(Projection),
+    ArrayElements(ArrayElements),
     Object(Object),
-
-    BinaryOp {
-        lhs: Box<Expression>,
-        operator: Operator,
-        rhs: Box<Expression>,
-    },
-
-    UnaryOp {
-        operator: Operator,
-        expr: Box<Expression>,
-    },
-
+    BinaryOp(BinaryOp),
+    UnaryOp(UnaryOp),
     Literal(LiteralKind),
-    This,
     Everything,
     Parent,
     Attr(String),
 }
 
-// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#TraversalExpression
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#AttributeAccess
 #[derive(Debug, PartialEq)]
-pub enum TraversalExpression {
+pub struct AttributeAccess {
+    pub expr: Box<Expression>,
+    pub name: String,
+}
 
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Dereference
+#[derive(Debug, PartialEq)]
+pub struct Dereference {
+    pub expr: Box<Expression>,
+}
+
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Slice
+#[derive(Debug, PartialEq)]
+pub struct SliceTraversal {
+    pub range: Range,
+}
+
+
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Filter
+#[derive(Debug, PartialEq)]
+pub struct FilterTraversal {
+    pub expr: Box<Expression>,
+    pub constraint: Box<Expression>,
+}
+
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#ElementAccess
+#[derive(Debug, PartialEq)]
+pub struct ElementAccess {
+    pub expr: Box<Expression>,
+    pub index: Box<Expression>,
+}
+
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#ArrayPostfix
+#[derive(Debug, PartialEq)]
+pub struct ArrayPostfix {
+    pub expr: Box<Expression>,
+}
+
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#Projection
+#[derive(Debug, PartialEq)]
+pub struct Projection {
+    pub expr: Box<Expression>,
+    pub object: Object,
+}
+
+// https://sanity-io.github.io/GROQ/GROQ-1.revision1/#AttributeAccess
+#[derive(Debug, PartialEq)]
+pub struct ArrayElements {
+    pub elements: Vec<Expression>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct BinaryOp {
+    pub lhs: Box<Expression>,
+    pub operator: Operator,
+    pub rhs: Box<Expression>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct UnaryOp {
+    pub operator: Operator,
+    pub expr: Box<Expression>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Literal {
+    pub kind: LiteralKind,
 }
 
 #[derive(Debug, PartialEq)]
@@ -124,6 +143,7 @@ pub enum Operator {
     Percent,
     DoubleStar,
     Dot,
+    DotDot,
     DotDotDot,
     Colon,
     Arrow,
