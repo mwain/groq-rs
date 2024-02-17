@@ -1,7 +1,9 @@
+use core::ops::ControlFlow;
 use std::collections::VecDeque;
 
 use crate::ast::{self, *};
 use crate::lexer::{Lexer, Token};
+use crate::visit;
 
 pub struct Parser<'a> {
     lexer: Lexer<'a>,
@@ -186,14 +188,14 @@ impl<'a> Parser<'a> {
 
         println!("-- parse_bracket_expr");
 
+        // "Disambiguating square bracket traversal" - https://sanity-io.github.io/GROQ/draft/#sec-Disambiguating-square-backet-traversal
+
         let parsed_expr = self.parse_expression(0)?;
         let kind = match parsed_expr.kind {
             ExpressionKind::Literal(LiteralKind::String(s)) => {
                 ExpressionKind::AttributeAccess(AttributeAccess { expr: lhs, name: s })
             }
 
-            // TODO: need to further disambiguating square brackets
-            // see https://sanity-io.github.io/GROQ/draft/#sec-Disambiguating-square-bracket-traversal
             ExpressionKind::Literal(LiteralKind::Int64(_)) => {
                 ExpressionKind::ElementAccess(ElementAccess {
                     expr: lhs,
@@ -201,34 +203,39 @@ impl<'a> Parser<'a> {
                 })
             }
 
-            ExpressionKind::BinaryOp(BinaryOp {
-                lhs,
-                operator: Operator::DotDot,
-                rhs,
-            }) => ExpressionKind::SliceTraversal(SliceTraversal {
-                range: ast::Range {
-                    start: lhs,
-                    end: rhs,
-                    inclusive: true,
-                },
-            }),
+            ExpressionKind::Range(range) => {
+                let lhs_constant = is_constant_evaluate(&range.start, &LiteralKind::Int64(0));
+                let rhs_constant = is_constant_evaluate(&range.end, &LiteralKind::Int64(0));
 
-            ExpressionKind::BinaryOp(BinaryOp {
-                lhs,
-                operator: Operator::DotDotDot,
-                rhs,
-            }) => ExpressionKind::SliceTraversal(SliceTraversal {
-                range: ast::Range {
-                    start: lhs,
-                    end: rhs,
-                    inclusive: false,
-                },
-            }),
+                if lhs_constant && rhs_constant {
+                    ExpressionKind::SliceTraversal(SliceTraversal {
+                        range: ast::Range {
+                            start: range.start,
+                            end: range.end,
+                            inclusive: range.inclusive,
+                        },
+                    })
+                } else {
+                    ExpressionKind::FilterTraversal(FilterTraversal {
+                        expr: lhs,
+                        constraint: make_expr(ExpressionKind::Range(range)),
+                    })
+                }
+            }
 
-            _ => ExpressionKind::FilterTraversal(FilterTraversal {
-                expr: lhs,
-                constraint: parsed_expr,
-            }),
+            _ => {
+                if is_constant_evaluate(&parsed_expr, &LiteralKind::Int64(0)) {
+                    ExpressionKind::ElementAccess(ElementAccess{
+                        expr: lhs,
+                        index: parsed_expr,
+                    })
+                } else {
+                    ExpressionKind::FilterTraversal(FilterTraversal {
+                        expr: lhs,
+                        constraint: parsed_expr,
+                    })
+                }
+            }
         };
 
         self.expect_token(Token::CloseBracket)?;
@@ -320,6 +327,7 @@ impl<'a> Parser<'a> {
                         })
                     }
 
+                    // todo: need to check this is valid for a dot
                     _ => ExpressionKind::BinaryOp(BinaryOp {
                         lhs,
                         operator: op,
@@ -327,6 +335,13 @@ impl<'a> Parser<'a> {
                     }),
                 }
             }
+
+            Operator::DotDot | Operator::DotDotDot => ExpressionKind::Range(Range {
+                start: lhs,
+                end: rhs,
+                inclusive: op == Operator::DotDot,
+            }),
+
             _ => ExpressionKind::BinaryOp(BinaryOp {
                 lhs,
                 operator: op,
@@ -414,6 +429,45 @@ fn is_postfix_operator(token: &Token) -> bool {
     }
 }
 
+fn is_constant_evaluate(expr: &Box<Expression>, lit_kind: &LiteralKind) -> bool {
+    visit::ClosureVisitor::walk(&expr, |expr| match &expr.kind {
+        ExpressionKind::Literal(lit) => {
+            if lit.is_same_kind_as(lit_kind) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+        ExpressionKind::BinaryOp(BinaryOp { lhs, operator, rhs }) => {
+            match operator {
+                Operator::Plus | Operator::Minus | Operator::Star | Operator::Slash | Operator::Percent | Operator::DoubleStar => {
+                    if is_constant_evaluate(lhs, lit_kind) && is_constant_evaluate(rhs, lit_kind) {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    }
+                }
+                _ => ControlFlow::Break(()),
+            }
+        }
+
+        ExpressionKind::UnaryOp(UnaryOp { operator, expr }) => {
+            match operator {
+                Operator::Plus | Operator::Minus => {
+                    if is_constant_evaluate(expr, lit_kind) {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    }
+                }
+                _ => ControlFlow::Break(()),
+            }
+        }
+        _ => ControlFlow::Break(()),
+    })
+    .is_continue()
+}
+
 fn parse_token_operator(token: &Token) -> Option<ast::Operator> {
     match token {
         Token::And => Some(ast::Operator::And),
@@ -482,7 +536,7 @@ fn binding_power(token: &Token, op: OperatorType) -> (u8, u8) {
             Token::Eq | Token::NotEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq => {
                 (40, 40)
             } // Level 4, non-associative
-            // Level 5 not implemented yet
+            Token::Dots(2) | Token::Dots(3) => (50, 50), // Level 5, non-associative
             Token::Plus | Token::Minus => (60, 61), // Level 6, left-associative
             Token::Asterisk | Token::Slash | Token::Percent => (70, 71), // Level 7, left-associative
             Token::DoubleStar => (91, 90), // Level 9, right-associative
@@ -930,15 +984,11 @@ mod tests {
             ),
 
             ranged_slice_incl: (
-                "foo[1..3]",
+                "foo[-1..3]",
                 make_expr(ExpressionKind::SliceTraversal(SliceTraversal {
                         range: ast::Range {
-                            start: Box::new(Expression {
-                                kind: ExpressionKind::Literal(LiteralKind::Int64(1))
-                            }),
-                            end: Box::new(Expression {
-                                kind: ExpressionKind::Literal(LiteralKind::Int64(3))
-                            }),
+                            start: make_unary_expr(Operator::Minus, make_expr(ExpressionKind::Literal(LiteralKind::Int64(1)))),
+                            end: make_expr(ExpressionKind::Literal(LiteralKind::Int64(3))),
                             inclusive: true
                         }
                     })
@@ -946,27 +996,33 @@ mod tests {
             ),
 
             ranged_slice_excl: (
-                "foo[1...3]",
+                "foo[1...-3]",
                 make_expr(ExpressionKind::SliceTraversal(SliceTraversal {
                         range: ast::Range {
-                            start: Box::new(Expression {
-                                kind: ExpressionKind::Literal(LiteralKind::Int64(1))
-                            }),
-                            end: Box::new(Expression {
-                                kind: ExpressionKind::Literal(LiteralKind::Int64(3))
-                            }),
+                            start: make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                            end: make_unary_expr(Operator::Minus, make_expr(ExpressionKind::Literal(LiteralKind::Int64(3)))),
                             inclusive: false
                         }
                     })
                 )
             ),
 
-            // TODO: needs impl
-            // ranged_filter: (
-            //     "foo[bar == foo..bar]",
-            //     Expression {
-            //     }
-            // ),
+            ranged_filter: (
+                "foo[bar == foo..bar]",
+                make_expr(ExpressionKind::FilterTraversal(FilterTraversal {
+                        expr: make_expr(ExpressionKind::Attr("foo".to_string())),
+                        constraint: make_binary_expr(
+                            make_expr(ExpressionKind::Attr("bar".to_string())),
+                            Operator::Eq,
+                            make_expr(ExpressionKind::Range(Range {
+                                start: make_expr(ExpressionKind::Attr("foo".to_string())),
+                                end: make_expr(ExpressionKind::Attr("bar".to_string())),
+                                inclusive: true
+                            }))
+                        )
+                    })
+                )
+            ),
         );
     }
 
@@ -1198,8 +1254,31 @@ mod tests {
                 ),
             ),
 
-            // // Rang(.., ...) not implemented yet
-            // // level_5:
+            level_5: (
+                "1 + 2..5",
+                make_expr(ExpressionKind::Range(Range {
+                    start: make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                        Operator::Plus,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                    ),
+                    end: make_expr(ExpressionKind::Literal(LiteralKind::Int64(5))),
+                    inclusive: true
+                })),
+            ),
+
+            level_5a: (
+                "1 + 2...5",
+                make_expr(ExpressionKind::Range(Range {
+                    start: make_binary_expr(
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+                        Operator::Plus,
+                        make_expr(ExpressionKind::Literal(LiteralKind::Int64(2)))
+                    ),
+                    end: make_expr(ExpressionKind::Literal(LiteralKind::Int64(5))),
+                    inclusive: false
+                })),
+            ),
 
             level_6: (
                 "1 + 2 - 3 + 4",
@@ -1595,6 +1674,36 @@ mod tests {
                 })
             )),
         );
+    }
+
+    #[test]
+    fn test_is_constant_evaluate() {
+        let expr = make_binary_expr(
+            make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+            Operator::Plus,
+            make_expr(ExpressionKind::Literal(LiteralKind::Int64(2))),
+        );
+        assert_eq!(is_constant_evaluate(&expr, &LiteralKind::Int64(0)), true);
+
+        let expr = make_binary_expr(
+            make_expr(ExpressionKind::Literal(LiteralKind::String("foo".to_string()))),
+            Operator::Plus,
+            make_expr(ExpressionKind::Literal(LiteralKind::String("bar".to_string()))),
+        );
+        assert_eq!(is_constant_evaluate(&expr, &LiteralKind::String("".to_string())), true);
+
+        let expr = make_binary_expr(
+            make_expr(ExpressionKind::Literal(LiteralKind::Int64(1))),
+            Operator::Plus,
+            make_expr(
+                ExpressionKind::Dereference(Dereference {
+                    expr: Box::new(Expression {
+                        kind: ExpressionKind::Attr("foo".to_string())
+                    })
+                })
+            ),
+        );
+        assert_eq!(is_constant_evaluate(&expr, &LiteralKind::Int64(0)), false);
     }
 
     #[test]

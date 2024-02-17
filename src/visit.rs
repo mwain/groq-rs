@@ -65,36 +65,40 @@ pub fn walk_expression<V: Visitor>(visitor: &mut V, expr: &Expression) -> Contro
         ExpressionKind::UnaryOp(unary) => {
             walk_expression(visitor, &unary.expr)?;
         }
+        ExpressionKind::Range(range) => {
+            walk_expression(visitor, &range.start)?;
+            walk_expression(visitor, &range.end)?;
+        }
         ExpressionKind::Literal(_) | ExpressionKind::Everything | ExpressionKind::Attr(_) => {}
     }
 
     ControlFlow::Continue(())
 }
 
-pub struct ClosureVisitor<F, T>
+pub struct ClosureVisitor<F, B>
 where
-    F: FnMut(&Expression) -> ControlFlow<T>,
+    F: Fn(&Expression) -> ControlFlow<B>,
 {
     f: F,
 }
 
-impl <F, T> ClosureVisitor<F, T>
+impl <F, B> ClosureVisitor<F, B>
 where
-    F: FnMut(&Expression) -> ControlFlow<T>,
+    F: Fn(&Expression) -> ControlFlow<B>,
 {
-    pub fn walk(expr: &Expression, f: F) -> ControlFlow<T> {
+    pub fn walk(expr: &Expression, f: F) -> ControlFlow<B> {
         let mut visitor = Self { f };
         walk_expression(&mut visitor, expr)
     }
 }
 
-impl <F, T> Visitor for ClosureVisitor<F, T>
+impl <F, B> Visitor for ClosureVisitor<F, B>
 where
-    F: FnMut(&Expression) -> ControlFlow<T>,
+    F: Fn(&Expression) -> ControlFlow<B>,
 {
-    type Break = T;
+    type Break = B;
 
-    fn visit_expression(&mut self, expr: &Expression) -> ControlFlow<T> {
+    fn visit_expression(&mut self, expr: &Expression) -> ControlFlow<B> {
         (self.f)(expr)
     }
 }
@@ -156,6 +160,9 @@ mod tests {
                 ExpressionKind::Attr(_) => {
                     self.visited.push("Attr".to_string());
                 }
+                ExpressionKind::Range(_) => {
+                    self.visited.push("Range".to_string());
+                }
             }
 
             ControlFlow::Continue(())
@@ -196,11 +203,11 @@ mod tests {
         let res = ClosureVisitor::walk(&expr, |expr| {
             match &expr.kind {
                 ExpressionKind::Projection(_) => {
-                    ControlFlow::Break(())
+                    ControlFlow::Break(true)
                 }
                 _ => ControlFlow::Continue(())
             }
         });
-        assert_eq!(res, ControlFlow::Break(()));
+        assert_eq!(res, ControlFlow::Break(true));
     }
 }

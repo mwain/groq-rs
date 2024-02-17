@@ -20,6 +20,7 @@ pub enum ExpressionKind {
     Literal(LiteralKind),
     Everything,
     Attr(String),
+    Range(Range),
 }
 
 // https://sanity-io.github.io/GROQ/GROQ-1.revision1/#AttributeAccess
@@ -100,6 +101,19 @@ pub enum LiteralKind {
     Int64(i64),
     Float64(f64),
     String(String),
+}
+
+impl LiteralKind {
+    pub fn is_same_kind_as(&self, other: &LiteralKind) -> bool {
+        match (self, other) {
+            (LiteralKind::Null, LiteralKind::Null) => true,
+            (LiteralKind::Boolean(_), LiteralKind::Boolean(_)) => true,
+            (LiteralKind::Int64(_), LiteralKind::Int64(_)) => true,
+            (LiteralKind::Float64(_), LiteralKind::Float64(_)) => true,
+            (LiteralKind::String(_), LiteralKind::String(_)) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
