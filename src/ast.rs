@@ -19,7 +19,6 @@ pub enum ExpressionKind {
     UnaryOp(UnaryOp),
     Literal(LiteralKind),
     Everything,
-    Parent,
     Attr(String),
 }
 
